@@ -37,18 +37,18 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "accounts.apps",
+    "accounts.apps.AccountsConfig",
 ]
 
 MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "accounts.middleware.SessionAuthenticationMiddleware",  # 添加自定义中间件
+    "django.middleware.security.SecurityMiddleware",  # 安全相关中间件
+    "django.contrib.sessions.middleware.SessionMiddleware",  # 会话支持中间件
+    "django.middleware.common.CommonMiddleware",  # 通用中间件
+    "django.middleware.csrf.CsrfViewMiddleware",  # CSRF 保护中间件
+    "django.contrib.auth.middleware.AuthenticationMiddleware",  # 认证中间件
+    "accounts.middleware.SessionAuthenticationMiddleware",  # Session 认证中间件
+    "django.contrib.messages.middleware.MessageMiddleware",  # 消息中间件
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",  # 点击劫持保护
 ]
 
 ROOT_URLCONF = "auth_center.urls"
@@ -104,9 +104,9 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/
 
-LANGUAGE_CODE = "en-us"
+LANGUAGE_CODE = "zh-hans"
 
-TIME_ZONE = "UTC"
+TIME_ZONE = "Asia/Shanghai"
 
 USE_I18N = True
 
@@ -122,3 +122,6 @@ STATIC_URL = "static/"
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+
+AUTH_USER_MODEL = "accounts.SysUser"

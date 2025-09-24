@@ -6,7 +6,9 @@
 import re
 
 from django.contrib.auth import login, logout
-from django.http import JsonResponse
+from django.contrib.auth.models import AbstractUser, AnonymousUser
+from django.http import HttpRequest, JsonResponse
+from django.shortcuts import redirect
 from django.utils.deprecation import MiddlewareMixin
 from django.utils.translation import gettext_lazy as _
 
@@ -18,6 +20,7 @@ from accounts.models import (
     SysUser,
     SysUserRole,
 )
+from common.ttl_lru_cache import TTLLRUCache, ttl_lru_cache
 
 
 class SessionAuthenticationMiddleware(MiddlewareMixin):
@@ -39,7 +42,17 @@ class SessionAuthenticationMiddleware(MiddlewareMixin):
     # 需要权限验证的 API 路径模式
     API_PATTERN = r"^/api/.+$"
 
-    def process_request(self, request):
+    def __init__(self, get_response=None):
+        super().__init__(get_response)
+        # 初始化菜单缓
+        self.menu_cache = TTLLRUCache(maxsize=200, ttl=3600)  # 缓存200个菜单，1小时过期
+
+    @ttl_lru_cache(maxsize=100, ttl=300)  # 缓存100个用户角色关系，30分钟
+    def _get_user_roles_cached(self, user_id):
+        """缓存用户角色查询"""
+        return list(SysUserRole.objects.filter(user_id=user_id).select_related("role"))
+
+    def process_request(self, request: HttpRequest):
         """
         处理每个请求前的认证和权限检查
         """
@@ -54,9 +67,8 @@ class SessionAuthenticationMiddleware(MiddlewareMixin):
                     {"code": 401, "message": _("用户未登录或会话已过期"), "data": None},
                     status=401,
                 )
-            # 对于非 API 请求，重定向到登录页
-            from django.shortcuts import redirect
 
+            # 对于非 API 请求，重定向到登录页
             return redirect("/login/")
 
         # 对于 API 请求，进行权限验证
@@ -67,7 +79,7 @@ class SessionAuthenticationMiddleware(MiddlewareMixin):
                 )
 
         # 将用户权限信息添加到请求对象中，方便视图函数使用
-        request.user_permissions = self._get_user_permissions(request.user)
+        setattr(request, "user_permissions", self._get_user_permissions(request.user))
 
         return None
 
@@ -82,7 +94,7 @@ class SessionAuthenticationMiddleware(MiddlewareMixin):
         """检查是否为 API 请求"""
         return re.match(self.API_PATTERN, path) is not None
 
-    def _check_permission(self, request):
+    def _check_permission(self, request: HttpRequest):
         """
         检查用户是否有访问当前 API 的权限
         """
@@ -169,7 +181,7 @@ class SessionAuthenticationMiddleware(MiddlewareMixin):
         except Exception:  # pylint: disable=broad-except
             return False
 
-    def _path_to_resource_code(self, path, method):
+    def _path_to_resource_code(self, path: str, method: str):
         """
         将 API 路径转换为资源标识码
         例如: /api/users/ -> api:users:get
@@ -180,7 +192,37 @@ class SessionAuthenticationMiddleware(MiddlewareMixin):
         resource_code = f"api:{clean_path.replace('/', ':')}:{method.lower()}"
         return resource_code
 
-    def _get_user_permissions(self, user):
+    @ttl_lru_cache(maxsize=50, ttl=1800)  # 缓存50个角色的菜单权限
+    def _get_menu_permissions_cached(self, role_ids_tuple):
+        """缓存菜单权限查询"""
+        role_ids = list(role_ids_tuple)
+        return list(
+            SysRoleMenuPermission.objects.filter(
+                role_id__in=role_ids, is_granted=True
+            ).select_related("menu")
+        )
+
+    @ttl_lru_cache(maxsize=50, ttl=1800)  # 缓存50个角色的资源权限
+    def _get_resource_permissions_cached(self, role_ids_tuple):
+        """缓存资源权限查询"""
+        role_ids = list(role_ids_tuple)
+        return list(
+            SysRoleResourcePermission.objects.filter(
+                role_id__in=role_ids
+            ).select_related("role")
+        )
+
+    @ttl_lru_cache(maxsize=50, ttl=1800)  # 缓存50个角色的字段权限
+    def _get_column_permissions_cached(self, role_ids_tuple):
+        """缓存字段权限查询"""
+        role_ids = list(role_ids_tuple)
+        return list(
+            SysRoleColumnPermission.objects.filter(role_id__in=role_ids).select_related(
+                "column", "column__table"
+            )
+        )
+
+    def _get_user_permissions(self, user: AbstractUser | AnonymousUser):
         """
         获取用户的完整权限信息
         """
@@ -262,14 +304,10 @@ class AuthViewHelper:
             if not user:
                 return False, _("用户不存在或已被禁用")
 
-            # 验证密码 (实际项目中密码应该是加密存储的)
-            # 这里假设密码是明文存储，实际应该使用 check_password
-            if (
-                user.password != password
-            ):  # 实际应该用: check_password(password, user.password)
+            if not user.check_password(password):  # 验证用户输入的密码
                 return False, _("密码错误")
 
-            # 使用 Django 的登录功能建立 session
+            # 建立 session
             login(request, user)
 
             # 更新最后登录时间
@@ -292,18 +330,18 @@ class AuthViewHelper:
             return False, _(f"登出失败: {str(e)}")
 
     @staticmethod
-    def get_current_user_info(request):
+    def get_current_user_info(request: HttpRequest):
         """
         获取当前用户信息
         """
         if not request.user.is_authenticated:
             return None
 
-        user = request.user
+        user: SysUser = request.user
         user_info = {
-            "user_id": user.user_id,
+            "id": user.pk,
             "username": user.username,
-            "user_name": user.user_name,
+            "user_name": user.cn_name,
             "email": user.email,
             "is_superuser": user.is_superuser,
         }

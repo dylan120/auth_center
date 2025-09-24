@@ -2,9 +2,25 @@
 系统权限模型定义
 """
 
+from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.models import AbstractUser
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models import Max
 from django.utils.translation import gettext_lazy as _
+
+# 权限级别选择
+PERM_LEVEL_ADMIN = 1
+PERM_LEVEL_DELETE = 2
+PERM_LEVEL_WRITE = 3
+PERM_LEVEL_READ = 4
+
+PERM_LEVEL_CHOICES = (
+    (PERM_LEVEL_READ, _("只读")),
+    (PERM_LEVEL_WRITE, _("可写")),
+    (PERM_LEVEL_DELETE, _("可删除")),
+    (PERM_LEVEL_ADMIN, _("管理")),
+)
 
 
 class BaseModel(models.Model):
@@ -134,7 +150,7 @@ class SysRole(BaseModel):
 
     role_id = models.AutoField(primary_key=True, verbose_name=_("角色ID"))
     role_name = models.CharField(max_length=50, unique=True, verbose_name=_("角色名称"))
-    role_code = models.CharField(max_length=50, unique=True, verbose_name=_("角色编码"))
+    # role_code = models.CharField(max_length=50, unique=True, verbose_name=_("角色编码"))
     role_level = models.IntegerField(
         default=1,
         validators=[MinValueValidator(1), MaxValueValidator(10)],
@@ -153,17 +169,18 @@ class SysRole(BaseModel):
         return str(self.role_name)
 
 
-class SysUser(BaseModel):
+class SysUser(AbstractUser):
     """系统用户模型"""
 
-    user_id = models.AutoField(primary_key=True, verbose_name=_("用户ID"))
-    username = models.CharField(max_length=50, unique=True, verbose_name=_("用户名"))
-    user_name = models.CharField(max_length=100, verbose_name=_("显示名称"))
-    email = models.EmailField(verbose_name=_("邮箱"))
-    is_superuser = models.BooleanField(default=False, verbose_name=_("是否超级用户"))
-    last_login = models.DateTimeField(
-        null=True, blank=True, verbose_name=_("最后登录时间")
-    )
+    # user_id = models.AutoField(primary_key=True, verbose_name=_("用户ID"))
+    # username = models.CharField(max_length=50, unique=True, verbose_name=_("用户名"))
+    # password = models.CharField(max_length=128, verbose_name=_("密码"))
+    # email = models.EmailField(verbose_name=_("邮箱"))
+    # is_superuser = models.BooleanField(default=False, verbose_name=_("是否超级用户"))
+    # last_login = models.DateTimeField(
+    #     null=True, blank=True, verbose_name=_("最后登录时间")
+    # )
+    cn_name = models.CharField(max_length=100, verbose_name=_("显示名称"))
 
     class Meta:
         db_table = "sys_user"
@@ -171,7 +188,32 @@ class SysUser(BaseModel):
         verbose_name_plural = _("系统用户")
 
     def __str__(self):
-        return str(self.user_name)
+        return str(self.cn_name)
+
+    def set_password(self, raw_password):
+        """加密原始密码并保存到 password 字段:cite[4]"""
+        self.password = make_password(raw_password)
+
+    def check_password(self, raw_password):
+        """验证输入的原始密码是否与存储的哈希密码匹配:cite[4]"""
+        return check_password(raw_password, self.password)
+
+    def get_effective_roles(self):
+        """
+        获取当前用户所有角色 + 所有权限级别更高（role_level 更小或相等）的角色
+        实现权限继承：高权限角色自动拥有低权限角色的权限
+        """
+
+        user_role_ids = self.user_roles.values_list("role_id", flat=True)
+        if not user_role_ids:
+            return SysRole.objects.none()
+
+        # 获取用户当前拥有的最小 role_level（最高权限）
+        max_level = SysRole.objects.filter(pk__in=user_roles).aggregate(
+            max_level=Max("role_level")
+        )["max_level"]
+
+        return SysRole.objects.filter(role_level__lte=max_level)
 
 
 class SysUserRole(BaseModel):
@@ -204,24 +246,11 @@ class SysUserRole(BaseModel):
         unique_together = ("user", "role")
 
     def __str__(self):
-        return f"{self.user.user_name} - {self.role.role_name}"
+        return f"{self.user.cn_name} - {self.role.role_name}"
 
 
 class SysRoleMenuPermission(BaseModel):
     """角色菜单权限模型"""
-
-    # 权限级别选择
-    PERM_LEVEL_READ = 1
-    PERM_LEVEL_WRITE = 2
-    PERM_LEVEL_DELETE = 3
-    PERM_LEVEL_ADMIN = 4
-
-    PERM_LEVEL_CHOICES = (
-        (PERM_LEVEL_READ, _("只读")),
-        (PERM_LEVEL_WRITE, _("可写")),
-        (PERM_LEVEL_DELETE, _("可删除")),
-        (PERM_LEVEL_ADMIN, _("管理")),
-    )
 
     role = models.ForeignKey(
         SysRole,
@@ -318,7 +347,7 @@ class SysRoleResourcePermission(BaseModel):
     resource_code = models.CharField(max_length=100, verbose_name=_("资源标识码"))
     resource_name = models.CharField(max_length=100, verbose_name=_("资源名称"))
     permission_level = models.IntegerField(
-        choices=SysRoleMenuPermission.PERM_LEVEL_CHOICES, verbose_name=_("权限级别")
+        choices=PERM_LEVEL_CHOICES, verbose_name=_("权限级别")
     )
     extra_config = models.JSONField(
         default=dict, blank=True, verbose_name=_("额外配置")
