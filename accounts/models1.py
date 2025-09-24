@@ -9,7 +9,7 @@
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import AbstractUser
-from django.db import models
+from django.db import connection, models
 from django.utils.translation import gettext_lazy as _
 
 
@@ -50,7 +50,7 @@ class SysPermissionSet(BaseModel):
         choices=SET_TYPE_CHOICES, default=SET_TYPE_CUSTOM, verbose_name=_("权限集类型")
     )
     description = models.TextField(blank=True, verbose_name=_("权限集描述"))
-    is_inheritable = models.BooleanField(default=True, verbose_name=_("是否可被继承"))
+    # is_inheritable = models.BooleanField(default=True, verbose_name=_("是否可被继承"))
 
     class Meta:
         db_table = "sys_permission_set"
@@ -69,12 +69,12 @@ class SysDataScope(BaseModel):
     # 数据范围类型（简化版）
     SCOPE_ALL = 1  # 全部数据
     SCOPE_SELF = 2  # 仅本人数据
-    SCOPE_CUSTOM = 3  # 自定义范围（可选）
+    # SCOPE_CUSTOM = 3  # 自定义范围（可选）
 
     SCOPE_TYPE_CHOICES = (
         (SCOPE_ALL, _("全部数据")),
         (SCOPE_SELF, _("仅本人数据")),
-        (SCOPE_CUSTOM, _("自定义范围")),
+        # (SCOPE_CUSTOM, _("自定义范围")),
     )
 
     scope_id = models.AutoField(primary_key=True, verbose_name=_("数据范围ID"))
@@ -89,7 +89,7 @@ class SysDataScope(BaseModel):
     )
 
     # 自定义SQL条件（用于SCOPE_CUSTOM类型）
-    custom_sql = models.TextField(blank=True, verbose_name=_("自定义SQL条件"))
+    # custom_sql = models.TextField(blank=True, verbose_name=_("自定义SQL条件"))
     description = models.TextField(blank=True, verbose_name=_("范围描述"))
 
     class Meta:
@@ -123,7 +123,6 @@ class SysResource(BaseModel):
     )
 
     resource_id = models.AutoField(primary_key=True, verbose_name=_("资源ID"))
-    # 移除 parent_resource 外键关联
     resource_name = models.CharField(max_length=100, verbose_name=_("资源名称"))
     resource_code = models.CharField(
         max_length=100, unique=True, verbose_name=_("资源编码")
@@ -286,7 +285,6 @@ class SysRole(BaseModel):
 
     def get_all_permissions(self):
         """获取角色所有权限（聚合所有权限集的权限）"""
-        from django.db import connection
 
         # 使用原生SQL查询提高性能
         sql = """
@@ -422,19 +420,20 @@ class SysUser(AbstractUser):
 
         return unique_permissions
 
-    def has_permission(self, resource_code, permission_type):
+    def has_permission(self, resource_code, required_permission_type):
         """检查用户是否具有某个资源的特定权限"""
         permissions = self.get_all_permissions()
-        target_perm = f"{resource_code}.{permission_type}"
-
+        # 获取用户对该资源的所有权限类型
+        user_permission_types = []
         for perm in permissions:
-            if (
-                perm.get("permission_code") == target_perm
-                or perm.get("resource__resource_code") == resource_code
-                and perm.get("permission_type") == permission_type
-            ):
-                return True
-        return False
+            if perm.get("resource__resource_code") == resource_code:
+                user_permission_types.append(perm.get("permission_type", 0))
+        if not user_permission_types:
+            return False
+
+        # 检查用户是否有任意一个权限类型 >= 要求的权限类型
+        max_user_permission = max(user_permission_types)
+        return max_user_permission >= required_permission_type
 
     def get_data_scope_condition(
         self, table_name, permission_type=SysPermission.PERM_READ
@@ -471,12 +470,12 @@ class SysUser(AbstractUser):
             creator_field = best_scope.get("resource__creator_field", "created_by")
             return f"{creator_field} = {self.id}"
 
-        elif scope_type == SysDataScope.SCOPE_CUSTOM:
-            custom_sql = best_scope.get("data_scope_sql", "")
-            if custom_sql:
-                # 替换模板变量
-                custom_sql = custom_sql.replace("{user_id}", str(self.id))
-                return custom_sql
+        # elif scope_type == SysDataScope.SCOPE_CUSTOM:
+        #     custom_sql = best_scope.get("data_scope_sql", "")
+        #     if custom_sql:
+        #         # 替换模板变量
+        #         custom_sql = custom_sql.replace("{user_id}", str(self.id))
+        #         return custom_sql
 
         return "1=0"  # 默认无权限
 
@@ -571,50 +570,102 @@ class SysUserDirectPermission(BaseModel):
         return f"{self.user.cn_name} - {self.permission}"
 
 
-# 使用示例和工具函数
-class DataPermissionManager:
-    """数据权限管理工具类"""
+# 权限检查工具类
+class PermissionChecker:
+    """权限检查工具类"""
 
     @staticmethod
-    def create_table_resource(
-        table_name,
-        model_class,
-        resource_name,
-        creator_field="created_by",
-    ):
-        """创建数据表资源"""
-        resource, created = SysResource.objects.get_or_create(
-            resource_code=f"table_{table_name}",
-            defaults={
-                "resource_name": resource_name,
-                "resource_type": SysResource.RESOURCE_TABLE,
-                "table_name": table_name,
-                "model_class": model_class,
-                "creator_field": creator_field,
-                "description": f"{resource_name}数据表",
-            },
-        )
-        return resource
+    def check_permission(user, resource_code, required_permission_type):
+        """
+        静态方法检查权限
+        """
+        return user.has_permission(resource_code, required_permission_type)
 
     @staticmethod
-    def create_default_data_scopes():
-        """创建默认数据范围"""
-        scopes = [
-            {
-                "scope_name": "全部数据",
-                "scope_code": "scope_all",
-                "scope_type": SysDataScope.SCOPE_ALL,
-                "description": "可查看全部数据",
-            },
-            {
-                "scope_name": "仅本人数据",
-                "scope_code": "scope_self",
-                "scope_type": SysDataScope.SCOPE_SELF,
-                "description": "仅可查看本人创建的数据",
-            },
-        ]
+    def require_permission(resource_code, required_permission_type):
+        """
+        装饰器：要求用户具有指定权限
+        直接在装饰器中指定resource_code和required_permission_type
+        """
 
-        for scope_data in scopes:
-            SysDataScope.objects.get_or_create(
-                scope_code=scope_data["scope_code"], defaults=scope_data
-            )
+        def decorator(view_func):
+            def wrapper(request, *args, **kwargs):
+                if not request.user.is_authenticated:
+                    from django.http import HttpResponseForbidden
+
+                    return HttpResponseForbidden("用户未登录")
+
+                if not request.user.has_permission(
+                    resource_code, required_permission_type
+                ):
+                    from django.http import HttpResponseForbidden
+
+                    return HttpResponseForbidden("权限不足")
+
+                return view_func(request, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    @classmethod
+    def require_read_permission(cls, resource_code):
+        """快捷方法：要求读取权限"""
+        return cls.require_permission(resource_code, SysPermission.PERM_READ)
+
+    @classmethod
+    def require_write_permission(cls, resource_code):
+        """快捷方法：要求写入权限"""
+        return cls.require_permission(resource_code, SysPermission.PERM_WRITE)
+
+    @classmethod
+    def require_delete_permission(cls, resource_code):
+        """快捷方法：要求删除权限"""
+        return cls.require_permission(resource_code, SysPermission.PERM_DELETE)
+
+    @classmethod
+    def require_manage_permission(cls, resource_code):
+        """快捷方法：要求管理权限"""
+        return cls.require_permission(resource_code, SysPermission.PERM_MANAGE)
+
+
+# 使用示例
+def example_usage():
+    """使用示例"""
+
+    # 方式1：使用具体权限装饰器
+    @PermissionChecker.require_permission("user_management", SysPermission.PERM_WRITE)
+    def edit_user_view(request, user_id):
+        # 这个视图需要用户管理资源的编辑权限
+        pass
+
+    # 方式2：使用快捷方法
+    @PermissionChecker.require_read_permission("sales_data")
+    def view_sales_data(request):
+        # 这个视图需要销售数据资源的读取权限
+        pass
+
+    @PermissionChecker.require_write_permission("product_management")
+    def edit_product_view(request):
+        # 这个视图需要产品管理资源的编辑权限
+        pass
+
+    @PermissionChecker.require_manage_permission("system_config")
+    def system_config_view(request):
+        # 这个视图需要系统配置资源的管理权限
+        pass
+
+    # 方式3：在类视图中使用
+    from django.utils.decorators import method_decorator
+    from django.views import View
+
+    class UserManagementView(View):
+        @method_decorator(PermissionChecker.require_write_permission("user_management"))
+        def post(self, request):
+            # 处理用户编辑请求
+            pass
+
+        @method_decorator(PermissionChecker.require_read_permission("user_management"))
+        def get(self, request):
+            # 获取用户列表
+            pass
