@@ -1,8 +1,303 @@
+from typing import List
+
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import AbstractUser
-from django.db import models
+from django.db import connection, models
+from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
+from accounts.models.perms import SysPermission, SysUserDirectPermission
+from accounts.models.resources import SysDataScope
+
+
+class SysCompany(BaseModel):
+    """
+    公司主体模型 - 支持多租户/多公司架构
+    """
+
+    company_id = models.AutoField(primary_key=True, verbose_name=_("公司ID"))
+    company_name = models.CharField(max_length=200, verbose_name=_("公司名称"))
+    # 公司状态
+    COMPANY_STATUS_ACTIVE = 1  # 正常
+    COMPANY_STATUS_DISABLED = 2  # 停用
+    COMPANY_STATUS_SUSPENDED = 3  # 暂停
+
+    COMPANY_STATUS_CHOICES = (
+        (COMPANY_STATUS_ACTIVE, _("正常")),
+        (COMPANY_STATUS_DISABLED, _("停用")),
+        (COMPANY_STATUS_SUSPENDED, _("暂停")),
+    )
+
+    status = models.IntegerField(
+        choices=COMPANY_STATUS_CHOICES,
+        default=COMPANY_STATUS_ACTIVE,
+        verbose_name=_("公司状态"),
+    )
+
+    parent_company = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="subsidiaries",
+        verbose_name=_("上级公司"),
+    )
+
+    class Meta:
+        db_table = "sys_company"
+        verbose_name = _("公司主体")
+        verbose_name_plural = _("公司主体")
+        ordering = ["company_name"]
+
+    def __str__(self):
+        return str(self.company_name)
+
+    def is_in_company_tree(self, target_company_id):
+        """检查公司是否在目标公司的树形结构中"""
+        if self.company_id == target_company_id:
+            return True
+
+        # 检查是否是目标公司的子公司
+        subsidiaries = self.get_all_subsidiaries()
+        return any(company.company_id == target_company_id for company in subsidiaries)
+
+    def get_all_subsidiaries(self):
+        """获取所有子公司（包括子公司的子公司）"""
+        subsidiaries = [self]
+        for subsidiary in self.subsidiaries.filter(is_active=True):
+            subsidiaries.extend(subsidiary.get_all_subsidiaries())
+        return subsidiaries
+
+    def get_all_departments(self):
+        """获取公司及所有子公司的部门"""
+        all_companies = self.get_all_subsidiaries()
+        company_ids = [company.company_id for company in all_companies]
+        return SysDepartment.objects.filter(company_id__in=company_ids, is_active=True)
+
+    def get_all_users(self):
+        """获取公司及所有子公司的用户"""
+        departments = self.get_all_departments()
+        dept_ids = [dept.dept_id for dept in departments]
+        return SysUser.objects.filter(department_id__in=dept_ids, is_active=True)
+
+    def get_company_roles(self, include_global=True):
+        """获取公司所有角色（可选包含全局角色）"""
+        roles = self.roles.filter(is_active=True)
+
+        if include_global:
+            global_roles = SysRole.objects.filter(company__isnull=True, is_active=True)
+            roles = list(roles) + list(global_roles)
+
+        return roles
+
+    def is_active_company(self):
+        """检查公司是否处于活跃状态"""
+        return self.status == self.COMPANY_STATUS_ACTIVE and self.is_active
+
+
+class SysDepartment(BaseModel):
+    """
+    部门模型 - 支持部门层级和角色关联
+    """
+
+    dept_id = models.AutoField(primary_key=True, verbose_name=_("部门ID"))
+    dept_name = models.CharField(max_length=100, verbose_name=_("部门名称"))
+    dept_code = models.CharField(max_length=100, unique=True, verbose_name=_("标识码"))
+    parent_dept = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="children",
+        verbose_name=_("上级部门"),
+    )
+
+    company = models.ForeignKey(
+        SysCompany,
+        on_delete=models.CASCADE,
+        related_name="departments",
+        verbose_name=_("所属公司"),
+    )
+
+    dept_level = models.IntegerField(default=1, verbose_name=_("部门层级"))
+    sort_order = models.IntegerField(default=0, verbose_name=_("排序序号"))
+    description = models.TextField(blank=True, verbose_name=_("部门描述"))
+
+    # 部门关联的角色（多对多）
+    roles = models.ManyToManyField(
+        "SysRole",
+        through="SysDepartmentRole",
+        related_name="departments",
+        verbose_name=_("关联角色"),
+        blank=True,
+    )
+
+    class Meta:
+        db_table = "sys_department"
+        verbose_name = _("部门")
+        verbose_name_plural = _("部门")
+        ordering = ["company", "dept_level", "sort_order", "dept_name"]
+        unique_together = ("company", "dept_code")
+
+    def __str__(self):
+        return str(self.dept_name)
+
+    def get_all_sub_departments(self):
+        """获取所有下级部门（包括自身）"""
+        departments = [self]
+        for child in self.children.filter(is_active=True):
+            departments.extend(child.get_all_sub_departments())
+        return departments
+
+    def get_all_users(self):
+        """获取部门及所有下级部门的用户"""
+
+        sub_depts = self.get_all_sub_departments()
+        dept_ids = [dept.dept_id for dept in sub_depts]
+        return SysUser.objects.filter(department_id__in=dept_ids, is_active=True)
+
+    def get_available_roles(self):
+        """获取部门可用的所有角色（包括继承的角色）"""
+        # 部门的直接角色
+        direct_roles = self.dept_roles.filter(is_active=True)
+
+        # 上级部门的角色（继承）
+        inherited_roles = []
+        if self.parent_dept:
+            inherited_roles = self.parent_dept.get_available_roles()
+
+        # 合并并去重
+        all_roles = list(direct_roles) + inherited_roles
+        seen = set()
+        unique_roles = []
+        for role in all_roles:
+            if role.role_id not in seen:
+                seen.add(role.role_id)
+                unique_roles.append(role)
+
+        return unique_roles
+
+
+class SysRole(BaseModel):
+    """
+    系统角色模型 - 简化版，通过权限集来管理权限
+    """
+
+    role_id = models.AutoField(primary_key=True, verbose_name=_("角色ID"))
+    role_name = models.CharField(max_length=50, unique=True, verbose_name=_("角色名称"))
+    role_code = models.CharField(max_length=50, unique=True, verbose_name=_("角色编码"))
+    description = models.TextField(blank=True, verbose_name=_("角色描述"))
+
+    company = models.ForeignKey(
+        SysCompany,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="roles",
+        verbose_name=_("所属公司"),
+        help_text=_("为空表示全局角色"),
+    )
+
+    # 角色关联的权限集（多对多）
+    permission_sets = models.ManyToManyField(
+        "SysPermissionSet",
+        through="SysRolePermissionSet",
+        related_name="roles",
+        verbose_name=_("权限集"),
+    )
+
+    class Meta:
+        db_table = "sys_role"
+        verbose_name = _("系统角色")
+        verbose_name_plural = _("系统角色")
+        ordering = ["role_name", "role_id"]
+        # 角色名称和编码在公司内唯一
+        unique_together = [("company", "role_name"), ("company", "role_code")]
+
+    def __str__(self):
+        company_name = self.company.company_name if self.company else _("全局")
+        return f"{company_name} - {self.role_name}"
+
+    def get_all_perms(self):
+        """获取角色所有权限（聚合所有权限集的权限）"""
+
+        # 使用原生SQL查询提高性能
+        sql = """
+        SELECT DISTINCT 
+            p.permission_id, p.permission_code, p.permission_name, 
+            p.permission_type, p.data_scope_id,
+            r.resource_id, r.resource_name, r.resource_type,
+            r.path, r.table_name, r.model_class, r.creator_field,
+            ds.scope_type as data_scope_type
+        FROM sys_role role
+        JOIN sys_role_permission_set rps ON role.role_id = rps.role_id
+        JOIN sys_permission_set ps ON rps.permission_set_id = ps.set_id
+        JOIN sys_permission_set_item psi ON ps.set_id = psi.permission_set_id
+        JOIN sys_permission p ON psi.permission_id = p.permission_id
+        JOIN sys_resource r ON p.resource_id = r.resource_id
+        LEFT JOIN sys_data_scope ds ON p.data_scope_id = ds.scope_id
+        WHERE role.role_id = %s AND role.is_active = TRUE 
+          AND ps.is_active = TRUE AND psi.is_active = TRUE 
+          AND p.is_active = TRUE AND r.is_active = TRUE
+        """
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [self.role_id])
+            columns = [col[0] for col in cursor.description]
+            permissions = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        return permissions
+
+
+class SysDepartmentRole(BaseModel):
+    """
+    部门与角色的关联关系
+    """
+
+    department = models.ForeignKey(
+        SysDepartment,
+        on_delete=models.CASCADE,
+        related_name="dept_roles",
+        verbose_name=_("部门"),
+    )
+    role = models.ForeignKey(
+        SysRole,
+        on_delete=models.CASCADE,
+        related_name="role_depts",
+        verbose_name=_("角色"),
+    )
+    assigned_by = models.ForeignKey(
+        "SysUser", on_delete=models.SET_NULL, null=True, verbose_name=_("分配人")
+    )
+    # 是否可继承给下级部门
+    is_inheritable = models.BooleanField(default=True, verbose_name=_("可继承"))
+    # 生效时间
+    valid_from = models.DateTimeField(null=True, blank=True, verbose_name=_("生效时间"))
+    valid_to = models.DateTimeField(null=True, blank=True, verbose_name=_("失效时间"))
+
+    class Meta:
+        db_table = "sys_department_role"
+        verbose_name = _("部门角色关联")
+        verbose_name_plural = _("部门角色关联")
+        unique_together = ("department", "role")
+
+    def clean(self):
+        """验证部门和角色属于同一公司"""
+        from django.core.exceptions import ValidationError
+
+        if (
+            self.department.company
+            and self.role.company
+            and self.department.company != self.role.company
+        ):
+            raise ValidationError(_("部门和角色必须属于同一公司"))
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.department.dept_name} - {self.role.role_name}"
 
 
 class SysUser(AbstractUser):
@@ -21,7 +316,7 @@ class SysUser(AbstractUser):
 
     # 用户直接关联的权限（用于特殊权限，优先级高于角色权限）
     direct_permissions = models.ManyToManyField(
-        SysPermission,
+        "SysPermission",
         through="SysUserDirectPermission",
         through_fields=("user", "permission"),
         related_name="direct_users",
@@ -45,7 +340,7 @@ class SysUser(AbstractUser):
         """验证密码"""
         return check_password(raw_password, self.password)
 
-    def get_company(self):
+    def get_company(self) -> SysCompany:
         """获取用户所属公司"""
         if self.department:
             return self.department.company
@@ -65,52 +360,51 @@ class SysUser(AbstractUser):
 
         return companies
 
-    def is_in_company(self, company_code):
+    def is_in_company(self, company_pk):
         """检查用户是否属于指定公司"""
         company = self.get_company()
-        return company and company.company_code == company_code
+        return company and company.pk == company_pk
 
-    def is_in_company_tree(self, company_code):
+    def is_in_company_tree(self, company_pk):
         """检查用户是否属于指定公司或其子公司"""
         companies = self.get_company_tree()
-        return any(company.company_code == company_code for company in companies)
+        return any(company.pk == company_pk for company in companies)
 
-    def get_accessible_companies(self):
-        """获取用户可以访问的公司列表（基于数据权限）"""
-        # 这里可以根据用户的数据权限范围返回可访问的公司
-        # 例如：超级管理员可以访问所有公司，普通用户只能访问自己所在公司
-        if self.has_permission("company_manage", SysPermission.PERM_MANAGE):
-            # 有公司管理权限，可以访问所有活跃公司
-            return SysCompany.objects.filter(
-                status=SysCompany.COMPANY_STATUS_ACTIVE, is_active=True
-            )
-        else:
-            # 普通用户只能访问自己所在公司
-            company = self.get_company()
-            return [company] if company else []
-
-    # 修改权限检查方法，加入公司范围限制
-    def has_permission_within_company(
-        self, resource_code, required_permission_type, company_code=None
-    ):
-        """
-        在指定公司范围内检查权限
-        """
-        # 如果没有指定公司，使用用户当前公司
-        if not company_code:
+    def get_company_roles(self, company_id=None):
+        """获取用户在指定公司下的角色"""
+        if not company_id:
             user_company = self.get_company()
-            company_code = user_company.company_code if user_company else None
+            company_id = user_company.company_id if user_company else None
 
-        # 检查公司访问权限
-        if company_code and not self.is_in_company_tree(company_code):
-            return False
-
-        # 检查具体权限
-        return self.has_permission(resource_code, required_permission_type)
-
-    def get_all_roles(self):
-        """获取用户所有角色（个人角色 + 部门角色）"""
         roles = []
+
+        # 个人分配的角色（按公司过滤）
+        user_roles = self.user_roles.filter(is_active=True).select_related("role")
+        for user_role in user_roles:
+            role = user_role.role
+            if not company_id or (role.company and role.company.pk == company_id):
+                roles.append(role)
+
+        # 部门分配的角色（按公司过滤）
+        if self.department:
+            dept_roles = self.department.get_available_roles()
+            for role in dept_roles:
+                if not company_id or (role.company and role.company.pk == company_id):
+                    roles.append(role)
+
+        # 去重
+        seen = set()
+        unique_roles = []
+        for role in roles:
+            if role.pk not in seen:
+                seen.add(role.pk)
+                unique_roles.append(role)
+
+        return unique_roles
+
+    def get_all_roles(self, company_pk=None) -> List[SysRole]:
+        """获取用户所有角色（个人角色 + 部门角色）"""
+        roles: List[SysRole] = []
 
         # 1. 个人直接分配的角色
         user_roles = self.user_roles.filter(is_active=True).select_related("role")
@@ -131,6 +425,39 @@ class SysUser(AbstractUser):
 
         return unique_roles
 
+    def get_accessible_companies(self):
+        """获取用户可以访问的公司列表（基于数据权限）"""
+        # 这里可以根据用户的数据权限范围返回可访问的公司
+        # 例如：超级管理员可以访问所有公司，普通用户只能访问自己所在公司
+        if self.has_permission("company_manage", SysPermission.PERM_MANAGE):
+            # 有公司管理权限，可以访问所有活跃公司
+            return SysCompany.objects.filter(
+                status=SysCompany.COMPANY_STATUS_ACTIVE, is_active=True
+            )
+        else:
+            # 普通用户只能访问自己所在公司
+            company = self.get_company()
+            return [company] if company else []
+
+    # 修改权限检查方法，加入公司范围限制
+    def has_permission_within_company(
+        self, resource_code, required_permission_type, company_pk=None
+    ):
+        """
+        在指定公司范围内检查权限
+        """
+        # 如果没有指定公司，使用用户当前公司
+        if not company_pk:
+            user_company = self.get_company()
+            company_pk = user_company.company_pk if user_company else None
+
+        # 检查公司访问权限
+        if company_pk and not self.is_in_company_tree(company_pk):
+            return False
+
+        # 检查具体权限
+        return self.has_permission(resource_code, required_permission_type)
+
     def get_department_roles(self):
         """获取用户通过部门分配的角色"""
         if not self.department:
@@ -148,19 +475,26 @@ class SysUser(AbstractUser):
         dept_roles = self.department.get_available_roles()
         return any(role.role_code == role_code for role in dept_roles)
 
-    def get_all_perms(self):
-        """获取用户所有权限（角色权限 + 直接权限）"""
+    # 权限检查方法，支持公司过滤
+    def get_all_perms(self, company_pk=None):
+        """获取用户所有权限（支持按公司过滤）"""
         permissions = []
 
-        # 获取角色权限
-        for user_role in self.get_all_roles():
-            role_permissions = user_role.role.get_all_perms()
+        # 获取角色权限（按公司过滤）
+        for role in self.get_company_roles(company_pk):
+            role_permissions = role.get_all_perms()
             permissions.extend(role_permissions)
 
-        # 获取直接权限
-        direct_perms = SysUserDirectPermission.objects.filter(
+        # 获取直接权限（按公司过滤）
+        direct_perms_qs = SysUserDirectPermission.objects.filter(
             user=self, is_active=True
-        ).values(
+        )
+
+        if company_pk:
+            # 假设SysUserDirectPermission已经添加了company字段
+            direct_perms_qs = direct_perms_qs.filter(company__company_id=company_pk)
+
+        direct_perms = direct_perms_qs.values(
             "permission_id",
             "permission_code",
             "permission_name",
@@ -174,6 +508,7 @@ class SysUser(AbstractUser):
             "resource__model_class",
             "resource__creator_field",
         )
+
         # 添加数据范围信息
         for perm in direct_perms:
             if perm["data_scope_id"]:
@@ -182,13 +517,11 @@ class SysUser(AbstractUser):
                         scope_id=perm["data_scope_id"]
                     )
                     perm["data_scope_type"] = data_scope.scope_type
-                    # perm["data_scope_sql"] = data_scope.custom_sql
                 except SysDataScope.DoesNotExist:
                     perm["data_scope_type"] = None
-                    perm["data_scope_sql"] = None
             permissions.append(perm)
 
-        # 去重（直接权限优先级高于角色权限）
+        # 去重
         seen = set()
         unique_permissions = []
         for perm in permissions:
@@ -199,9 +532,9 @@ class SysUser(AbstractUser):
 
         return unique_permissions
 
-    def has_permission(self, resource_code, required_permission_type):
-        """检查用户是否具有某个资源的特定权限"""
-        permissions = self.get_all_perms()
+    def has_permission(self, resource_code, required_permission_type, company_pk=None):
+        """检查用户在指定公司范围内的权限"""
+        permissions = self.get_all_perms(company_pk)
         # 获取用户对该资源的所有权限类型
         user_permission_types = []
         for perm in permissions:
@@ -289,269 +622,6 @@ class SysUser(AbstractUser):
         return "=" in condition and str(self.id) in condition
 
 
-class SysDepartment(BaseModel):
-    """
-    部门模型 - 支持部门层级和角色关联
-    """
-
-    dept_id = models.AutoField(primary_key=True, verbose_name=_("部门ID"))
-    dept_name = models.CharField(max_length=100, verbose_name=_("部门名称"))
-    dept_code = models.CharField(max_length=50, unique=True, verbose_name=_("部门编码"))
-    parent_dept = models.ForeignKey(
-        "self",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="children",
-        verbose_name=_("上级部门"),
-    )
-
-    company = models.ForeignKey(
-        SysCompany,
-        on_delete=models.CASCADE,
-        related_name="departments",
-        verbose_name=_("所属公司"),
-    )
-
-    dept_level = models.IntegerField(default=1, verbose_name=_("部门层级"))
-    sort_order = models.IntegerField(default=0, verbose_name=_("排序序号"))
-    description = models.TextField(blank=True, verbose_name=_("部门描述"))
-
-    # 部门关联的角色（多对多）
-    roles = models.ManyToManyField(
-        "SysRole",
-        through="SysDepartmentRole",
-        related_name="departments",
-        verbose_name=_("关联角色"),
-        blank=True,
-    )
-
-    class Meta:
-        db_table = "sys_department"
-        verbose_name = _("部门")
-        verbose_name_plural = _("部门")
-        ordering = ["company", "dept_level", "sort_order", "dept_name"]
-        unique_together = ("company", "dept_code")
-
-    def __str__(self):
-        return str(self.dept_name)
-
-    def get_all_sub_departments(self):
-        """获取所有下级部门（包括自身）"""
-        departments = [self]
-        for child in self.children.filter(is_active=True):
-            departments.extend(child.get_all_sub_departments())
-        return departments
-
-    def get_all_users(self):
-        """获取部门及所有下级部门的用户"""
-
-        sub_depts = self.get_all_sub_departments()
-        dept_ids = [dept.dept_id for dept in sub_depts]
-        return SysUser.objects.filter(department_id__in=dept_ids, is_active=True)
-
-    def get_available_roles(self):
-        """获取部门可用的所有角色（包括继承的角色）"""
-        # 部门的直接角色
-        direct_roles = self.dept_roles.filter(is_active=True)
-
-        # 上级部门的角色（继承）
-        inherited_roles = []
-        if self.parent_dept:
-            inherited_roles = self.parent_dept.get_available_roles()
-
-        # 合并并去重
-        all_roles = list(direct_roles) + inherited_roles
-        seen = set()
-        unique_roles = []
-        for role in all_roles:
-            if role.role_id not in seen:
-                seen.add(role.role_id)
-                unique_roles.append(role)
-
-        return unique_roles
-
-
-class SysRole(BaseModel):
-    """
-    系统角色模型 - 简化版，通过权限集来管理权限
-    """
-
-    role_id = models.AutoField(primary_key=True, verbose_name=_("角色ID"))
-    role_name = models.CharField(max_length=50, unique=True, verbose_name=_("角色名称"))
-    role_code = models.CharField(max_length=50, unique=True, verbose_name=_("角色编码"))
-    description = models.TextField(blank=True, verbose_name=_("角色描述"))
-
-    # 角色关联的权限集（多对多）
-    permission_sets = models.ManyToManyField(
-        "SysPermissionSet",
-        through="SysRolePermissionSet",
-        related_name="roles",
-        verbose_name=_("权限集"),
-    )
-
-    class Meta:
-        db_table = "sys_role"
-        verbose_name = _("系统角色")
-        verbose_name_plural = _("系统角色")
-        ordering = ["role_name", "role_id"]
-
-    def __str__(self):
-        return str(self.role_name)
-
-    def get_all_perms(self):
-        """获取角色所有权限（聚合所有权限集的权限）"""
-
-        # 使用原生SQL查询提高性能
-        sql = """
-        SELECT DISTINCT 
-            p.permission_id, p.permission_code, p.permission_name, 
-            p.permission_type, p.data_scope_id,
-            r.resource_id, r.resource_name, r.resource_type,
-            r.path, r.table_name, r.model_class, r.creator_field,
-            ds.scope_type as data_scope_type
-        FROM sys_role role
-        JOIN sys_role_permission_set rps ON role.role_id = rps.role_id
-        JOIN sys_permission_set ps ON rps.permission_set_id = ps.set_id
-        JOIN sys_permission_set_item psi ON ps.set_id = psi.permission_set_id
-        JOIN sys_permission p ON psi.permission_id = p.permission_id
-        JOIN sys_resource r ON p.resource_id = r.resource_id
-        LEFT JOIN sys_data_scope ds ON p.data_scope_id = ds.scope_id
-        WHERE role.role_id = %s AND role.is_active = TRUE 
-          AND ps.is_active = TRUE AND psi.is_active = TRUE 
-          AND p.is_active = TRUE AND r.is_active = TRUE
-        """
-
-        with connection.cursor() as cursor:
-            cursor.execute(sql, [self.role_id])
-            columns = [col[0] for col in cursor.description]
-            permissions = [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-        return permissions
-
-
-class SysCompany(BaseModel):
-    """
-    公司主体模型 - 支持多租户/多公司架构
-    """
-
-    company_id = models.AutoField(primary_key=True, verbose_name=_("公司ID"))
-    company_name = models.CharField(max_length=200, verbose_name=_("公司名称"))
-    company_code = models.CharField(
-        max_length=50, unique=True, verbose_name=_("公司编码")
-    )
-    legal_person = models.CharField(
-        max_length=100, blank=True, verbose_name=_("法人代表")
-    )
-    unified_social_credit_code = models.CharField(
-        max_length=50, blank=True, verbose_name=_("统一社会信用代码")
-    )
-    contact_phone = models.CharField(
-        max_length=20, blank=True, verbose_name=_("联系电话")
-    )
-    email = models.EmailField(blank=True, verbose_name=_("邮箱"))
-    address = models.TextField(blank=True, verbose_name=_("地址"))
-
-    # 公司状态
-    COMPANY_STATUS_ACTIVE = 1  # 正常
-    COMPANY_STATUS_DISABLED = 2  # 停用
-    COMPANY_STATUS_SUSPENDED = 3  # 暂停
-
-    COMPANY_STATUS_CHOICES = (
-        (COMPANY_STATUS_ACTIVE, _("正常")),
-        (COMPANY_STATUS_DISABLED, _("停用")),
-        (COMPANY_STATUS_SUSPENDED, _("暂停")),
-    )
-
-    status = models.IntegerField(
-        choices=COMPANY_STATUS_CHOICES,
-        default=COMPANY_STATUS_ACTIVE,
-        verbose_name=_("公司状态"),
-    )
-
-    # 公司级别（用于集团架构）
-    company_level = models.IntegerField(default=1, verbose_name=_("公司层级"))
-    parent_company = models.ForeignKey(
-        "self",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="subsidiaries",
-        verbose_name=_("上级公司"),
-    )
-
-    # 公司配置信息
-    config = models.JSONField(default=dict, blank=True, verbose_name=_("公司配置"))
-
-    class Meta:
-        db_table = "sys_company"
-        verbose_name = _("公司主体")
-        verbose_name_plural = _("公司主体")
-        ordering = ["company_level", "company_name"]
-
-    def __str__(self):
-        return str(self.company_name)
-
-    def get_all_subsidiaries(self):
-        """获取所有子公司（包括子公司的子公司）"""
-        subsidiaries = [self]
-        for subsidiary in self.subsidiaries.filter(is_active=True):
-            subsidiaries.extend(subsidiary.get_all_subsidiaries())
-        return subsidiaries
-
-    def get_all_departments(self):
-        """获取公司及所有子公司的部门"""
-        all_companies = self.get_all_subsidiaries()
-        company_ids = [company.company_id for company in all_companies]
-        return SysDepartment.objects.filter(company_id__in=company_ids, is_active=True)
-
-    def get_all_users(self):
-        """获取公司及所有子公司的用户"""
-        departments = self.get_all_departments()
-        dept_ids = [dept.dept_id for dept in departments]
-        return SysUser.objects.filter(department_id__in=dept_ids, is_active=True)
-
-    def is_active_company(self):
-        """检查公司是否处于活跃状态"""
-        return self.status == self.COMPANY_STATUS_ACTIVE and self.is_active
-
-
-class SysDepartmentRole(BaseModel):
-    """
-    部门与角色的关联关系
-    """
-
-    department = models.ForeignKey(
-        SysDepartment,
-        on_delete=models.CASCADE,
-        related_name="dept_roles",
-        verbose_name=_("部门"),
-    )
-    role = models.ForeignKey(
-        SysRole,
-        on_delete=models.CASCADE,
-        related_name="role_depts",
-        verbose_name=_("角色"),
-    )
-    assigned_by = models.ForeignKey(
-        "SysUser", on_delete=models.SET_NULL, null=True, verbose_name=_("分配人")
-    )
-    # 是否可继承给下级部门
-    is_inheritable = models.BooleanField(default=True, verbose_name=_("可继承"))
-    # 生效时间
-    valid_from = models.DateTimeField(null=True, blank=True, verbose_name=_("生效时间"))
-    valid_to = models.DateTimeField(null=True, blank=True, verbose_name=_("失效时间"))
-
-    class Meta:
-        db_table = "sys_department_role"
-        verbose_name = _("部门角色关联")
-        verbose_name_plural = _("部门角色关联")
-        unique_together = ("department", "role")
-
-    def __str__(self):
-        return f"{self.department.dept_name} - {self.role.role_name}"
-
-
 class SysUserRole(BaseModel):
     """用户角色关联"""
 
@@ -580,6 +650,27 @@ class SysUserRole(BaseModel):
         verbose_name = _("用户角色关联")
         verbose_name_plural = _("用户角色关联")
         unique_together = ("user", "role")
+
+    def clean(self):
+        """验证用户和角色公司一致性"""
+        from django.core.exceptions import ValidationError
+
+        user_company = self.user.get_company()
+        role_company = self.role.company
+
+        # 如果角色有特定公司，用户必须属于该公司或其子公司
+        if role_company and user_company:
+            if not user_company.is_in_company_tree(role_company.company_id):
+                raise ValidationError(_("用户必须属于角色所在公司或其子公司"))
+
+        # 如果用户有特定公司，全局角色可以分配，但公司特定角色必须匹配
+        elif user_company and role_company:
+            if user_company != role_company:
+                raise ValidationError(_("用户和角色必须属于同一公司"))
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.user.cn_name} - {self.role.role_name}"
