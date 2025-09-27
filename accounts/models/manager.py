@@ -1,6 +1,5 @@
 from accounts.models.perms import SysPermission
 from accounts.models.resources import (
-    SysApiResource,
     SysFieldResource,
     SysMenuResource,
     SysModuleResource,
@@ -20,7 +19,6 @@ class ResourceManager:
         """根据资源类型获取对应的模型类"""
         resource_models = {
             SysResource.RESOURCE_MENU: SysMenuResource,
-            SysResource.RESOURCE_API: SysApiResource,
             SysResource.RESOURCE_TABLE: SysTableResource,
             SysResource.RESOURCE_FIELD: SysFieldResource,
             SysResource.RESOURCE_MODULE: SysModuleResource,

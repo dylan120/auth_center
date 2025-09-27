@@ -475,121 +475,179 @@ class SysUser(AbstractUser):
         dept_roles = self.department.get_available_roles()
         return any(role.role_code == role_code for role in dept_roles)
 
-    # 权限检查方法，支持公司过滤
     def get_all_perms(self, company_pk=None):
-        """获取用户所有权限（支持按公司过滤）"""
+        """
+        获取用户所有权限（支持按公司过滤）
+        修复版本：使用正确的关联查询
+        """
         permissions = []
 
-        # 获取角色权限（按公司过滤）
-        for role in self.get_company_roles(company_pk):
+        # 1. 获取角色权限（按公司过滤）
+        roles = self.get_all_roles(company_pk)
+        for role in roles:
             role_permissions = role.get_all_perms()
             permissions.extend(role_permissions)
 
-        # 获取直接权限（按公司过滤）
-        direct_perms_qs = SysUserDirectPermission.objects.filter(
-            user=self, is_active=True
-        )
+        # 2. 获取直接权限（按公司过滤）
+        direct_perms = self._get_direct_permissions(company_pk)
+        permissions.extend(direct_perms)
 
-        if company_pk:
-            # 假设SysUserDirectPermission已经添加了company字段
-            direct_perms_qs = direct_perms_qs.filter(company__company_id=company_pk)
-
-        direct_perms = direct_perms_qs.values(
-            "permission_id",
-            "permission_code",
-            "permission_name",
-            "permission_type",
-            "data_scope_id",
-            "resource__resource_id",
-            "resource__resource_name",
-            "resource__resource_type",
-            "resource__path",
-            "resource__table_name",
-            "resource__model_class",
-            "resource__creator_field",
-        )
-
-        # 添加数据范围信息
-        for perm in direct_perms:
-            if perm["data_scope_id"]:
-                try:
-                    data_scope = SysDataScope.objects.get(
-                        scope_id=perm["data_scope_id"]
-                    )
-                    perm["data_scope_type"] = data_scope.scope_type
-                except SysDataScope.DoesNotExist:
-                    perm["data_scope_type"] = None
-            permissions.append(perm)
-
-        # 去重
+        # 去重（基于权限编码和资源ID）
         seen = set()
         unique_permissions = []
         for perm in permissions:
-            key = (perm.get("permission_code"), perm.get("resource__resource_id"))
+            # 使用权限编码和资源ID作为唯一标识
+            key = (perm.get("permission_code"), perm.get("resource_id"))
             if key not in seen:
                 seen.add(key)
                 unique_permissions.append(perm)
 
         return unique_permissions
 
+    def _get_direct_permissions(self, company_pk=None):
+        """
+        获取用户的直接权限
+        """
+        # 查询直接权限记录
+        direct_perms_qs = (
+            SysUserDirectPermission.objects.filter(user=self, is_active=True)
+            .select_related("permission", "permission__data_scope")
+            .prefetch_related("permission__content_type")
+        )
+
+        # 按公司过滤
+        if company_pk:
+            direct_perms_qs = direct_perms_qs.filter(
+                models.Q(permission__company__isnull=True)
+                | models.Q(permission__company__pk=company_pk)
+            )
+
+        direct_permissions = []
+
+        for direct_perm in direct_perms_qs:
+            permission = direct_perm.permission
+
+            # 获取关联的资源信息
+            resource = None
+            if permission.content_type and permission.object_id:
+                try:
+                    resource = permission.content_type.get_object_for_this_type(
+                        pk=permission.object_id
+                    )
+                except:
+                    resource = None
+
+            perm_data = {
+                "permission_id": permission.permission_id,
+                "permission_code": permission.permission_code,
+                "permission_name": permission.permission_name,
+                "permission_type": permission.permission_type,
+                "data_scope_id": permission.data_scope_id,
+                "data_scope_type": permission.data_scope.scope_type
+                if permission.data_scope
+                else None,
+                "is_direct": True,  # 标记为直接权限
+                "assigned_by": direct_perm.assigned_by_id,
+                "valid_from": direct_perm.valid_from,
+                "valid_to": direct_perm.valid_to,
+            }
+
+            # 添加资源信息
+            if resource:
+                perm_data.update(
+                    {
+                        "resource_id": resource.resource_id,
+                        "resource_name": resource.resource_name,
+                        "resource_code": resource.resource_code,
+                        "resource_type": resource.resource_type,
+                        "path": getattr(resource, "path", ""),
+                        "table_name": getattr(resource, "table_name", ""),
+                        "model_class": getattr(resource, "model_class", ""),
+                        "creator_field": getattr(
+                            resource, "creator_field", "created_by"
+                        ),
+                    }
+                )
+
+            direct_permissions.append(perm_data)
+
+        return direct_permissions
+
     def has_permission(self, resource_code, required_permission_type, company_pk=None):
-        """检查用户在指定公司范围内的权限"""
+        """
+        检查用户是否对指定资源拥有所需权限（字符串类型）
+
+        Args:
+            resource_code (str): 资源编码，如 "media"
+            required_permission_type (str): 所需权限类型，如 "read"
+            company_pk (int, optional): 公司ID
+
+        Returns:
+            bool: 是否拥有权限
+        """
+        if self.is_superuser:
+            return True
+
         permissions = self.get_all_perms(company_pk)
         # 获取用户对该资源的所有权限类型
-        user_permission_types = []
         for perm in permissions:
-            if perm.get("resource__resource_code") == resource_code:
-                user_permission_types.append(perm.get("permission_type", 0))
-        if not user_permission_types:
-            return False
+            if perm.get("resource__resource_code") != resource_code:
+                continue
 
-        # 检查用户是否有任意一个权限类型 >= 要求的权限类型
-        max_user_permission = max(user_permission_types)
-        return max_user_permission >= required_permission_type
+            user_perm_type = perm.get("permission_type")
+            if not user_perm_type:
+                continue
+
+            # 1. manage 权限覆盖所有
+            if user_perm_type == SysPermission.PERM_MANAGE:
+                return True
+
+            # 2. 精确匹配
+            if user_perm_type == required_permission_type:
+                return True
+
+        return False
 
     def get_data_scope_condition(
         self, table_name, permission_type=SysPermission.PERM_READ
     ):
         """
         获取用户对指定数据表的查询条件
-        返回SQL WHERE条件字符串
         """
-        # 查找用户对该表的所有读取权限
+        # 查找用户对该表的所有相关权限
         table_permissions = []
         for perm in self.get_all_perms():
             if (
-                perm.get("resource__resource_type") == "table"
-                and perm.get("resource__table_name") == table_name
+                perm.get("table_name") == table_name
                 and perm.get("permission_type") == permission_type
             ):
                 table_permissions.append(perm)
 
         if not table_permissions:
-            return "1=0"  # 无权限，返回永远为假的条件
+            return "1=0"  # 无权限
 
-        # 取最宽松的数据范围（数值越小范围越大）
+        # 取最宽松的数据范围
         best_scope = min(
             table_permissions,
             key=lambda x: x.get("data_scope_type", SysDataScope.SCOPE_SELF),
         )
 
         scope_type = best_scope.get("data_scope_type")
+        creator_field = best_scope.get("creator_field", "created_by")
 
         if scope_type == SysDataScope.SCOPE_ALL:
             return "1=1"  # 全部数据
-
         elif scope_type == SysDataScope.SCOPE_SELF:
-            creator_field = best_scope.get("resource__creator_field", "created_by")
             return f"{creator_field} = {self.id}"
+        elif scope_type == SysDataScope.SCOPE_DEPT:
+            if self.department:
+                dept_users = self.department.get_all_users()
+                user_ids = [str(user.id) for user in dept_users]
+                if user_ids:
+                    return f"{creator_field} IN ({','.join(user_ids)})"
+            return "1=0"
 
-        # elif scope_type == SysDataScope.SCOPE_CUSTOM:
-        #     custom_sql = best_scope.get("data_scope_sql", "")
-        #     if custom_sql:
-        #         # 替换模板变量
-        #         custom_sql = custom_sql.replace("{user_id}", str(self.id))
-        #         return custom_sql
-
-        return "1=0"  # 默认无权限
+        return "1=0"
 
     def filter_queryset_by_permission(
         self, queryset, permission_type=SysPermission.PERM_READ
@@ -620,6 +678,26 @@ class SysUser(AbstractUser):
         """检查用户是否只能查看自己的数据"""
         condition = self.get_data_scope_condition(table_name)
         return "=" in condition and str(self.id) in condition
+
+    def get_effective_permissions(self, resource_code, company_pk=None):
+        """
+        获取用户对指定资源的所有有效权限类型
+        """
+        permissions = self.get_all_perms(company_pk)
+        effective_perms = set()
+
+        for perm in permissions:
+            if perm.get("resource_code") == resource_code:
+                perm_type = perm.get("permission_type")
+                if perm_type:
+                    effective_perms.add(perm_type)
+                    # 如果有管理权限，添加所有权限类型
+                    if perm_type == SysPermission.PERM_MANAGE:
+                        return set(
+                            [choice[0] for choice in SysPermission.PERM_TYPE_CHOICES]
+                        )
+
+        return effective_perms
 
 
 class SysUserRole(BaseModel):

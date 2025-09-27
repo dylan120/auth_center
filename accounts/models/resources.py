@@ -40,23 +40,13 @@ class SysDataScope(BaseModel):
         verbose_name_plural = _("数据范围")
 
     def __str__(self):
-        return f"{self.scope_name} ({self.get_scope_type_display()})"
+        return f"{self.scope_name}"
 
 
 class SysResource(BaseModel):
     """
     资源基类 - 所有资源类型的公共字段
     """
-
-    # 资源所属公司（Null表示全局资源）
-    company = models.ForeignKey(
-        "SysCompany",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="resources",
-        verbose_name=_("所属公司"),
-    )
 
     # 资源类型
     RESOURCE_MENU = "menu"  # 菜单
@@ -99,6 +89,15 @@ class SysMenuResource(SysResource):
     菜单资源表
     """
 
+    # 资源所属公司（Null表示全局资源）
+    # company = models.ForeignKey(
+    #     "SysCompany",
+    #     on_delete=models.CASCADE,
+    #     null=True,
+    #     blank=True,
+    #     related_name="menu_resources",
+    #     verbose_name=_("所属公司"),
+    # )
     # 菜单特定字段
     path = models.CharField(max_length=200, verbose_name=_("菜单路径"))
     icon = models.CharField(max_length=50, blank=True, verbose_name=_("菜单图标"))
@@ -129,34 +128,6 @@ class SysMenuResource(SysResource):
         super().save(*args, **kwargs)
 
 
-class SysApiResource(SysResource):
-    """
-    API接口资源表
-    """
-
-    # API特定字段
-    path = models.CharField(max_length=200, verbose_name=_("API路径"))
-    method = models.CharField(max_length=10, verbose_name=_("HTTP方法"))
-    # API分组
-    api_group = models.CharField(max_length=50, blank=True, verbose_name=_("API分组"))
-    # 是否需要认证
-    require_auth = models.BooleanField(default=True, verbose_name=_("需要认证"))
-    # 是否记录日志
-    log_enabled = models.BooleanField(default=True, verbose_name=_("记录日志"))
-    # 请求频率限制（次/分钟）
-    rate_limit = models.IntegerField(default=0, verbose_name=_("频率限制"))
-
-    class Meta:
-        db_table = "sys_api_resource"
-        verbose_name = _("API资源")
-        verbose_name_plural = _("API资源")
-        unique_together = ("path", "method")  # 同一路径和方法不能重复
-
-    def save(self, *args, **kwargs):
-        self.resource_type = SysResource.RESOURCE_API
-        super().save(*args, **kwargs)
-
-
 class SysTableResource(SysResource):
     """
     数据表资源表
@@ -171,8 +142,6 @@ class SysTableResource(SysResource):
     )
     # 表描述
     table_comment = models.TextField(blank=True, verbose_name=_("表注释"))
-    # 是否系统表
-    is_system_table = models.BooleanField(default=False, verbose_name=_("系统表"))
     # 数据保留策略（天）
     data_retention_days = models.IntegerField(default=0, verbose_name=_("数据保留天数"))
 
@@ -234,8 +203,8 @@ class SysFieldResource(SysResource):
     def save(self, *args, **kwargs):
         self.resource_type = SysResource.RESOURCE_FIELD
         # 自动设置公司（从表资源继承）
-        if not self.company and self.table_resource:
-            self.company = self.table_resource.company
+        # if not self.company and self.table_resource:
+        #     self.company = self.table_resource.company
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -272,3 +241,31 @@ class SysModuleResource(SysResource):
     def save(self, *args, **kwargs):
         self.resource_type = SysResource.RESOURCE_MODULE
         super().save(*args, **kwargs)
+
+
+# class SysApiResource(SysResource):
+#     """
+#     API接口资源表
+#     """
+
+#     # API特定字段
+#     path = models.CharField(max_length=200, verbose_name=_("API路径"))
+#     method = models.CharField(max_length=10, verbose_name=_("HTTP方法"))
+#     # API分组
+#     api_group = models.CharField(max_length=50, blank=True, verbose_name=_("API分组"))
+#     # 是否需要认证
+#     require_auth = models.BooleanField(default=True, verbose_name=_("需要认证"))
+#     # 是否记录日志
+#     log_enabled = models.BooleanField(default=True, verbose_name=_("记录日志"))
+#     # 请求频率限制（次/分钟）
+#     rate_limit = models.IntegerField(default=0, verbose_name=_("频率限制"))
+
+#     class Meta:
+#         db_table = "sys_api_resource"
+#         verbose_name = _("API资源")
+#         verbose_name_plural = _("API资源")
+#         unique_together = ("path", "method")  # 同一路径和方法不能重复
+
+#     def save(self, *args, **kwargs):
+#         self.resource_type = SysResource.RESOURCE_API
+#         super().save(*args, **kwargs)

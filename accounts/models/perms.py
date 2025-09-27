@@ -1,12 +1,11 @@
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import models
-
-# from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
-from accounts.models.resources import SysDataScope, SysResource
-
-# from accounts.models.user import SysUser
+from accounts.models.resources import SysDataScope
 
 
 class SysRolePermissionSet(BaseModel):
@@ -35,14 +34,17 @@ class SysRolePermissionSet(BaseModel):
 
     def clean(self):
         """验证角色和权限集属于同一公司"""
-        from django.core.exceptions import ValidationError
 
-        if (
-            self.role.company
-            and self.permission_set.company
-            and self.role.company != self.permission_set.company
-        ):
-            raise ValidationError(_("角色和权限集必须属于同一公司"))
+        role_company = getattr(self.role, "company", None)
+        permset_company = getattr(self.permission_set, "company", None)
+
+        # 权限集属于某个公司（非平台级）
+        if permset_company is not None:
+            # 则角色必须也属于该公司（不能是平台级角色）
+            if role_company is None:
+                raise ValidationError(_("平台级角色不能绑定公司专属权限集"))
+            if role_company != permset_company:
+                raise ValidationError(_("角色和权限集必须属于同一公司"))
 
     def save(self, *args, **kwargs):
         self.clean()
@@ -94,7 +96,7 @@ class SysPermissionSet(BaseModel):
 
     def __str__(self):
         company_name = self.company.company_name if self.company else _("全局")
-        return f"{company_name} - {self.set_name} ({self.get_set_type_display()})"
+        return f"{company_name} - {self.set_name}"
 
 
 class SysPermission(BaseModel):
@@ -104,13 +106,12 @@ class SysPermission(BaseModel):
     """
 
     # 操作权限类型
-    PERM_READ = 1  # 查看
-    PERM_WRITE = 2  # 新增/编辑
-    PERM_DELETE = 3  # 删除
-    PERM_EXPORT = 4  # 导出
-    PERM_IMPORT = 5  # 导入
-    PERM_EXECUTE = 6  # 执行
-    PERM_MANAGE = 9999  # 管理
+    PERM_READ = "read"  # 查看
+    PERM_WRITE = "write"  # 新增/编辑
+    PERM_DELETE = "delete"  # 删除
+    PERM_EXPORT = "export"  # 导出
+    PERM_IMPORT = "import"  # 导入
+    PERM_MANAGE = "manage"  # 管理
 
     PERM_TYPE_CHOICES = (
         (PERM_READ, _("查看")),
@@ -118,7 +119,6 @@ class SysPermission(BaseModel):
         (PERM_DELETE, _("删除")),
         (PERM_EXPORT, _("导出")),
         (PERM_IMPORT, _("导入")),
-        (PERM_EXECUTE, _("执行")),
         (PERM_MANAGE, _("管理")),
     )
 
@@ -129,21 +129,19 @@ class SysPermission(BaseModel):
         on_delete=models.CASCADE,
         null=True,
         blank=True,
-        related_name="permissions",
+        related_name="company_permissions",
         verbose_name=_("所属公司"),
-        help_text=_("为空时继承资源的公司设置"),
+        help_text=_("为空时代表全局"),
     )
 
-    resource = models.ForeignKey(
-        SysResource,
-        on_delete=models.CASCADE,
-        related_name="permissions",
-        verbose_name=_("资源"),
-    )
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    object_id = models.PositiveIntegerField()
+    resource = GenericForeignKey("content_type", "object_id")
+
     permission_code = models.CharField(max_length=50, verbose_name=_("权限编码"))
     permission_name = models.CharField(max_length=100, verbose_name=_("权限名称"))
-    permission_type = models.IntegerField(
-        choices=PERM_TYPE_CHOICES, verbose_name=_("权限类型")
+    permission_type = models.CharField(
+        max_length=20, choices=PERM_TYPE_CHOICES, verbose_name=_("权限类型")
     )
     # 关联数据范围
     data_scope = models.ForeignKey(
@@ -160,7 +158,17 @@ class SysPermission(BaseModel):
         db_table = "sys_permission"
         verbose_name = _("系统权限")
         verbose_name_plural = _("系统权限")
-        unique_together = ("resource", "permission_type")
+        unique_together = ("content_type", "object_id", "company", "permission_type")
+
+    def covers(self, target_perm_type: str) -> bool:
+        """
+        判断当前权限是否足以覆盖目标权限类型。
+        - 'manage' 覆盖所有权限；
+        - 其他权限仅当类型完全匹配时生效。
+        """
+        if self.permission_type == self.PERM_MANAGE:
+            return True
+        return self.permission_type == target_perm_type
 
     def __str__(self):
         return f"{self.resource.resource_name}.{self.permission_name}"
@@ -207,6 +215,16 @@ class SysUserDirectPermission(BaseModel):
     permission = models.ForeignKey(
         SysPermission, on_delete=models.CASCADE, verbose_name=_("权限")
     )
+    company = models.ForeignKey(
+        "SysCompany",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="user_direct_permissions",
+        verbose_name=_("所属公司"),
+        help_text=_("为空时代表全局"),
+    )
+
     assigned_by = models.ForeignKey(
         "SysUser",
         on_delete=models.SET_NULL,

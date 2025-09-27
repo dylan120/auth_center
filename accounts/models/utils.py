@@ -1,7 +1,6 @@
 from django.http import HttpResponseForbidden
 
-from accounts.models.perms import SysFieldPermission, SysPermission
-from accounts.models.resources import SysResource
+from accounts.models.perms import SysPermission
 
 
 class PermissionChecker:
