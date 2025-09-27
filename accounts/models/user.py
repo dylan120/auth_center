@@ -123,15 +123,6 @@ class SysDepartment(BaseModel):
     sort_order = models.IntegerField(default=0, verbose_name=_("排序序号"))
     description = models.TextField(blank=True, verbose_name=_("部门描述"))
 
-    # 部门关联的角色（多对多）
-    roles = models.ManyToManyField(
-        "SysRole",
-        through="SysDepartmentRole",
-        related_name="departments",
-        verbose_name=_("关联角色"),
-        blank=True,
-    )
-
     class Meta:
         db_table = "sys_department"
         verbose_name = _("部门")
@@ -199,12 +190,12 @@ class SysRole(BaseModel):
     )
 
     # 角色关联的权限集（多对多）
-    permission_sets = models.ManyToManyField(
-        "SysPermissionSet",
-        through="SysRolePermissionSet",
-        related_name="roles",
-        verbose_name=_("权限集"),
-    )
+    # permission_sets = models.ManyToManyField(
+    #     "SysPermissionSet",
+    #     through="SysRolePermissionSet",
+    #     related_name="roles",
+    #     verbose_name=_("权限集"),
+    # )
 
     class Meta:
         db_table = "sys_role"
@@ -218,35 +209,103 @@ class SysRole(BaseModel):
         company_name = self.company.company_name if self.company else _("全局")
         return f"{company_name} - {self.role_name}"
 
-    def get_all_perms(self):
-        """获取角色所有权限（聚合所有权限集的权限）"""
+    # def get_all_perms(self):
+    #     """获取角色所有权限（聚合所有权限集的权限）"""
+    #     # 使用原生SQL查询提高性能
+    #     sql = """
+    #     SELECT DISTINCT
+    #         p.permission_id, p.permission_code, p.permission_name,
+    #         p.permission_type, p.data_scope_id,
+    #         r.resource_id, r.resource_name, r.resource_type,
+    #         r.resource_code, r.path, r.table_name, r.model_class, r.creator_field,
+    #         ds.scope_type as data_scope_type
+    #     FROM sys_role role
+    #     JOIN sys_role_permission_set rps ON role.role_id = rps.role_id
+    #     JOIN sys_permission_set ps ON rps.permission_set_id = ps.set_id
+    #     JOIN sys_permission_set_item psi ON ps.set_id = psi.permission_set_id
+    #     JOIN sys_permission p ON psi.permission_id = p.permission_id
+    #     LEFT JOIN sys_resource r ON p.resource_id = r.resource_id
+    #     LEFT JOIN sys_data_scope ds ON p.data_scope_id = ds.scope_id
+    #     WHERE role.role_id = %s AND role.is_active = TRUE
+    #       AND rps.is_active = TRUE AND ps.is_active = TRUE
+    #       AND psi.is_active = TRUE AND p.is_active = TRUE
+    #       AND (r.resource_id IS NULL OR r.is_active = TRUE)
+    #     """
 
-        # 使用原生SQL查询提高性能
-        sql = """
-        SELECT DISTINCT 
-            p.permission_id, p.permission_code, p.permission_name, 
-            p.permission_type, p.data_scope_id,
-            r.resource_id, r.resource_name, r.resource_type,
-            r.path, r.table_name, r.model_class, r.creator_field,
-            ds.scope_type as data_scope_type
-        FROM sys_role role
-        JOIN sys_role_permission_set rps ON role.role_id = rps.role_id
-        JOIN sys_permission_set ps ON rps.permission_set_id = ps.set_id
-        JOIN sys_permission_set_item psi ON ps.set_id = psi.permission_set_id
-        JOIN sys_permission p ON psi.permission_id = p.permission_id
-        JOIN sys_resource r ON p.resource_id = r.resource_id
-        LEFT JOIN sys_data_scope ds ON p.data_scope_id = ds.scope_id
-        WHERE role.role_id = %s AND role.is_active = TRUE 
-          AND ps.is_active = TRUE AND psi.is_active = TRUE 
-          AND p.is_active = TRUE AND r.is_active = TRUE
-        """
+    #     with connection.cursor() as cursor:
+    #         cursor.execute(sql, [self.role_id])
+    #         columns = [col[0] for col in cursor.description]
+    #         permissions = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
-        with connection.cursor() as cursor:
-            cursor.execute(sql, [self.role_id])
-            columns = [col[0] for col in cursor.description]
-            permissions = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    #     return permissions
+
+    # 或者使用Django ORM的版本（更推荐，便于维护）
+    def get_all_perms_orm(self):
+        """使用Django ORM获取角色所有权限"""
+        from django.db.models import Q
+
+        # 获取角色关联的所有活跃权限集
+        permission_sets = (
+            self.sysrolepermissionset_set.filter(
+                is_active=True, permission_set__is_active=True
+            )
+            .select_related("permission_set")
+            .prefetch_related("permission_set__permission_items__permission")
+        )
+
+        permissions = []
+
+        for role_perm_set in permission_sets:
+            permission_set = role_perm_set.permission_set
+
+            # 获取权限集中的所有权限项
+            perm_items = permission_set.permission_items.filter(
+                is_active=True, permission__is_active=True
+            ).select_related("permission")
+
+            for item in perm_items:
+                permission = item.permission
+
+                # 构建权限信息
+                perm_data = {
+                    "permission_id": permission.permission_id,
+                    "permission_code": permission.permission_code,
+                    "permission_name": permission.permission_name,
+                    "permission_type": permission.permission_type,
+                    "data_scope_id": permission.data_scope_id,
+                    "is_direct": False,  # 角色权限不是直接权限
+                }
+
+                # 添加资源信息（如果存在）
+                if hasattr(permission, "resource") and permission.resource:
+                    resource = permission.resource
+                    perm_data.update(
+                        {
+                            "resource_id": resource.resource_id,
+                            "resource_name": resource.resource_name,
+                            "resource_code": resource.resource_code,
+                            "resource_type": resource.resource_type,
+                            "path": getattr(resource, "path", ""),
+                            "table_name": getattr(resource, "table_name", ""),
+                            "model_class": getattr(resource, "model_class", ""),
+                            "creator_field": getattr(
+                                resource, "creator_field", "created_by"
+                            ),
+                        }
+                    )
+
+                # 添加数据范围信息（如果存在）
+                if permission.data_scope:
+                    perm_data["data_scope_type"] = permission.data_scope.scope_type
+
+                permissions.append(perm_data)
 
         return permissions
+
+    # 推荐使用ORM版本
+    def get_all_perms(self):
+        """获取角色所有权限 - 使用ORM版本"""
+        return self.get_all_perms_orm()
 
 
 class SysDepartmentRole(BaseModel):
@@ -315,14 +374,14 @@ class SysUser(AbstractUser):
     )
 
     # 用户直接关联的权限（用于特殊权限，优先级高于角色权限）
-    direct_permissions = models.ManyToManyField(
-        "SysPermission",
-        through="SysUserDirectPermission",
-        through_fields=("user", "permission"),
-        related_name="direct_users",
-        verbose_name=_("直接权限"),
-        blank=True,
-    )
+    # direct_permissions = models.ManyToManyField(
+    #     "SysPermission",
+    #     through="SysUserDirectPermission",
+    #     through_fields=("user", "permission"),
+    #     related_name="direct_users",
+    #     verbose_name=_("直接权限"),
+    #     blank=True,
+    # )
 
     class Meta:
         db_table = "sys_user"
@@ -591,7 +650,7 @@ class SysUser(AbstractUser):
         permissions = self.get_all_perms(company_pk)
         # 获取用户对该资源的所有权限类型
         for perm in permissions:
-            if perm.get("resource__resource_code") != resource_code:
+            if perm.get("resource_code") != resource_code:
                 continue
 
             user_perm_type = perm.get("permission_type")
