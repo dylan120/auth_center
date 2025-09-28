@@ -1,6 +1,6 @@
 from django.test import TestCase
 
-from accounts.models.user import SysCompany, SysDepartment
+from accounts.models.user import SysCompany, SysDepartment, SysUser
 
 
 class SysDepartmentTest(TestCase):
