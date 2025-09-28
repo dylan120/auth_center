@@ -5,6 +5,11 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
+from accounts.models.dimension import (
+    SysPermissionSetItemDimensionOption,
+    SysTableDimension,
+    SysUserDirectPermissionDimensionOption,
+)
 
 
 class SysRolePermissionSet(BaseModel):
@@ -13,7 +18,10 @@ class SysRolePermissionSet(BaseModel):
     """
 
     role = models.ForeignKey(
-        "SysRole", on_delete=models.CASCADE, verbose_name=_("角色")
+        "SysRole",
+        related_name="permission_bindings",
+        on_delete=models.CASCADE,
+        verbose_name=_("角色"),
     )
     permission_set = models.ForeignKey(
         "SysPermissionSet", on_delete=models.CASCADE, verbose_name=_("权限集")
@@ -211,6 +219,53 @@ class SysPermissionSetItem(BaseModel):
         verbose_name_plural = _("权限集项")
         unique_together = ("permission_set", "permission")
 
+    def get_dimension_options(self):
+        """获取权限集项的维度选项"""
+        return SysPermissionSetItemDimensionOption.objects.filter(
+            permission_set_item=self,
+        ).select_related("dimension_option", "dimension_option__dimension")
+
+    def get_dimension_sql_conditions(self, table_resource):
+        """获取维度SQL条件"""
+        dimension_options = self.get_dimension_options()
+        if not dimension_options:
+            return None
+
+        conditions = []
+        dimension_groups = {}
+
+        # 按维度分组选项
+        for dim_option_rel in dimension_options:
+            dimension = dim_option_rel.dimension_option.dimension
+            if dimension.dimension_code not in dimension_groups:
+                dimension_groups[dimension.dimension_code] = []
+            dimension_groups[dimension.dimension_code].append(
+                dim_option_rel.dimension_option.option_value
+            )
+
+        # 为每个维度生成SQL条件
+        for dimension_code, option_values in dimension_groups.items():
+            # 查找表维度配置
+            table_dimension = (
+                SysTableDimension.objects.filter(
+                    table=table_resource,
+                    dimension__dimension_code=dimension_code,
+                )
+                .select_related("dimension")
+                .first()
+            )
+
+            if table_dimension and option_values:
+                # 这里需要根据实际业务逻辑确定字段名
+                # 假设字段名与维度编码相同，或者存储在表维度配置中
+                field_name = table_dimension.dimension.dimension_code
+                value_list = ",".join([f"'{v}'" for v in option_values])
+                conditions.append(f"{field_name} IN ({value_list})")
+
+        if conditions:
+            return " AND ".join(conditions)
+        return None
+
     def __str__(self):
         return f"{self.permission_set.set_name} - {self.permission}"
 
@@ -249,6 +304,50 @@ class SysUserDirectPermission(BaseModel):
         verbose_name = _("用户直接权限")
         verbose_name_plural = _("用户直接权限")
         unique_together = ("user", "permission")
+
+    def get_dimension_options(self):
+        """获取用户直接权限的维度选项"""
+        return SysUserDirectPermissionDimensionOption.objects.filter(
+            user_direct_permission=self,
+        ).select_related("dimension_option", "dimension_option__dimension")
+
+    def get_dimension_sql_conditions(self, table_resource):
+        """获取维度SQL条件"""
+        dimension_options = self.get_dimension_options()
+        if not dimension_options:
+            return None
+
+        conditions = []
+        dimension_groups = {}
+
+        # 按维度分组选项
+        for dim_option_rel in dimension_options:
+            dimension = dim_option_rel.dimension_option.dimension
+            if dimension.dimension_code not in dimension_groups:
+                dimension_groups[dimension.dimension_code] = []
+            dimension_groups[dimension.dimension_code].append(
+                dim_option_rel.dimension_option.option_value
+            )
+
+        # 为每个维度生成SQL条件
+        for dimension_code, option_values in dimension_groups.items():
+            table_dimension = (
+                SysTableDimension.objects.filter(
+                    table=table_resource,
+                    dimension__dimension_code=dimension_code,
+                )
+                .select_related("dimension")
+                .first()
+            )
+
+            if table_dimension and option_values:
+                field_name = table_dimension.dimension.dimension_code
+                value_list = ",".join([f"'{v}'" for v in option_values])
+                conditions.append(f"{field_name} IN ({value_list})")
+
+        if conditions:
+            return " AND ".join(conditions)
+        return None
 
     def __str__(self):
         return f"{self.user.cn_name} - {self.permission}"

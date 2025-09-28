@@ -87,85 +87,57 @@ class SysTableDimension(BaseModel):
         return f"{self.table.table_name} - {self.dimension.dimension_name}"
 
 
-# 修改原SysPermissionSetItem模型，关联维度选项
-class SysPermissionSetItem(BaseModel):
+class SysPermissionSetItemDimensionOption(BaseModel):
     """
-    权限集项 - 扩展支持维度选项
+    权限集项与维度选项的关联表（替代 ManyToMany）
     """
 
-    permission_set = models.ForeignKey(
-        SysPermissionSet,
+    permission_set_item = models.ForeignKey(
+        "SysPermissionSetItem",
         on_delete=models.CASCADE,
-        related_name="permission_items",
-        verbose_name=_("权限集"),
+        related_name="dimension_option_relations",
+        verbose_name=_("权限集项"),
     )
-    permission = models.ForeignKey(
-        SysPermission,
-        on_delete=models.CASCADE,
-        related_name="set_items",
-        verbose_name=_("权限"),
-    )
-    # 新增：关联维度选项（多对多）
-    dimension_options = models.ManyToManyField(
+    dimension_option = models.ForeignKey(
         SysDimensionOption,
-        blank=True,
-        related_name="permission_items",
+        on_delete=models.CASCADE,
+        related_name="permission_set_item_relations",
         verbose_name=_("维度选项"),
     )
-    valid_from = models.DateTimeField(null=True, blank=True, verbose_name=_("生效时间"))
-    valid_to = models.DateTimeField(null=True, blank=True, verbose_name=_("失效时间"))
 
     class Meta:
-        db_table = "sys_permission_set_item"
-        verbose_name = _("权限集项")
-        verbose_name_plural = _("权限集项")
-        unique_together = ("permission_set", "permission")
+        db_table = "sys_permission_set_item_dimension_option"
+        verbose_name = _("权限集项-维度选项关联")
+        verbose_name_plural = _("权限集项-维度选项关联")
+        unique_together = ("permission_set_item", "dimension_option")
 
     def __str__(self):
-        return f"{self.permission_set.set_name} - {self.permission}"
+        return f"{self.permission_set_item} → {self.dimension_option}"
 
 
-# 修改原SysUserDirectPermission模型，关联维度选项
-class SysUserDirectPermission(BaseModel):
-    """用户直接权限关联 - 扩展支持维度选项"""
+class SysUserDirectPermissionDimensionOption(BaseModel):
+    """
+    用户直接权限与维度选项的关联表（替代 ManyToMany）
+    """
 
-    user = models.ForeignKey(
-        "SysUser", on_delete=models.CASCADE, verbose_name=_("用户")
-    )
-    permission = models.ForeignKey(
-        SysPermission, on_delete=models.CASCADE, verbose_name=_("权限")
-    )
-    company = models.ForeignKey(
-        "SysCompany",
+    user_direct_permission = models.ForeignKey(
+        "SysUserDirectPermission",
         on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="user_direct_permissions",
-        verbose_name=_("所属公司"),
-        help_text=_("为空时代表全局"),
+        related_name="dimension_option_relations",
+        verbose_name=_("用户直接权限"),
     )
-    # 新增：关联维度选项（多对多）
-    dimension_options = models.ManyToManyField(
+    dimension_option = models.ForeignKey(
         SysDimensionOption,
-        blank=True,
-        related_name="user_direct_permissions",
+        on_delete=models.CASCADE,
+        related_name="user_direct_permission_relations",
         verbose_name=_("维度选项"),
     )
-    assigned_by = models.ForeignKey(
-        "SysUser",
-        on_delete=models.SET_NULL,
-        null=True,
-        related_name="assigned_direct_permissions",
-        verbose_name=_("分配人"),
-    )
-    valid_from = models.DateTimeField(null=True, blank=True, verbose_name=_("生效时间"))
-    valid_to = models.DateTimeField(null=True, blank=True, verbose_name=_("失效时间"))
 
     class Meta:
-        db_table = "sys_user_direct_permission"
-        verbose_name = _("用户直接权限")
-        verbose_name_plural = _("用户直接权限")
-        unique_together = ("user", "permission")
+        db_table = "sys_user_direct_permission_dimension_option"
+        verbose_name = _("用户直接权限-维度选项关联")
+        verbose_name_plural = _("用户直接权限-维度选项关联")
+        unique_together = ("user_direct_permission", "dimension_option")
 
     def __str__(self):
-        return f"{self.user.cn_name} - {self.permission}"
+        return f"{self.user_direct_permission} → {self.dimension_option}"

@@ -2,11 +2,17 @@ from typing import List
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import AbstractUser
+from django.core.exceptions import ValidationError
 from django.db import connection, models
 from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
-from accounts.models.perms import SysPermission, SysUserDirectPermission
+from accounts.models.perms import (
+    SysPermission,
+    SysRolePermissionSet,
+    SysUserDirectPermission,
+)
+from accounts.models.resources import SysTableResource
 from accounts.models.scope import SysDataScope
 
 
@@ -64,7 +70,7 @@ class SysCompany(BaseModel):
     def get_all_subsidiaries(self):
         """获取所有子公司（包括子公司的子公司）"""
         subsidiaries = [self]
-        for subsidiary in self.subsidiaries.filter(is_active=True):
+        for subsidiary in self.subsidiaries:
             subsidiaries.extend(subsidiary.get_all_subsidiaries())
         return subsidiaries
 
@@ -72,27 +78,17 @@ class SysCompany(BaseModel):
         """获取公司及所有子公司的部门"""
         all_companies = self.get_all_subsidiaries()
         company_ids = [company.company_id for company in all_companies]
-        return SysDepartment.objects.filter(company_id__in=company_ids, is_active=True)
+        return SysDepartment.objects.filter(company_id__in=company_ids)
 
     def get_all_users(self):
         """获取公司及所有子公司的用户"""
         departments = self.get_all_departments()
         dept_ids = [dept.dept_id for dept in departments]
-        return SysUser.objects.filter(department_id__in=dept_ids, is_active=True)
-
-    def get_company_roles(self, include_global=True):
-        """获取公司所有角色（可选包含全局角色）"""
-        roles = self.roles.filter(is_active=True)
-
-        if include_global:
-            global_roles = SysRole.objects.filter(company__isnull=True, is_active=True)
-            roles = list(roles) + list(global_roles)
-
-        return roles
+        return SysUser.objects.filter(department_id__in=dept_ids)
 
     def is_active_company(self):
         """检查公司是否处于活跃状态"""
-        return self.status == self.COMPANY_STATUS_ACTIVE and self.is_active
+        return self.status == self.COMPANY_STATUS_ACTIVE
 
 
 class SysDepartment(BaseModel):
@@ -136,7 +132,7 @@ class SysDepartment(BaseModel):
     def get_all_sub_departments(self):
         """获取所有下级部门（包括自身）"""
         departments = [self]
-        for child in self.children.filter(is_active=True):
+        for child in self.children:
             departments.extend(child.get_all_sub_departments())
         return departments
 
@@ -145,12 +141,12 @@ class SysDepartment(BaseModel):
 
         sub_depts = self.get_all_sub_departments()
         dept_ids = [dept.dept_id for dept in sub_depts]
-        return SysUser.objects.filter(department_id__in=dept_ids, is_active=True)
+        return SysUser.objects.filter(department_id__in=dept_ids)
 
     def get_available_roles(self):
         """获取部门可用的所有角色（包括继承的角色）"""
         # 部门的直接角色
-        direct_roles = self.dept_roles.filter(is_active=True)
+        direct_roles = self.dept_roles
 
         # 上级部门的角色（继承）
         inherited_roles = []
@@ -189,14 +185,6 @@ class SysRole(BaseModel):
         help_text=_("为空表示全局角色"),
     )
 
-    # 角色关联的权限集（多对多）
-    # permission_sets = models.ManyToManyField(
-    #     "SysPermissionSet",
-    #     through="SysRolePermissionSet",
-    #     related_name="roles",
-    #     verbose_name=_("权限集"),
-    # )
-
     class Meta:
         db_table = "sys_role"
         verbose_name = _("系统角色")
@@ -209,49 +197,12 @@ class SysRole(BaseModel):
         company_name = self.company.company_name if self.company else _("全局")
         return f"{company_name} - {self.role_name}"
 
-    # def get_all_perms(self):
-    #     """获取角色所有权限（聚合所有权限集的权限）"""
-    #     # 使用原生SQL查询提高性能
-    #     sql = """
-    #     SELECT DISTINCT
-    #         p.permission_id, p.permission_code, p.permission_name,
-    #         p.permission_type, p.data_scope_id,
-    #         r.resource_id, r.resource_name, r.resource_type,
-    #         r.resource_code, r.path, r.table_name, r.model_class, r.creator_field,
-    #         ds.scope_type as data_scope_type
-    #     FROM sys_role role
-    #     JOIN sys_role_permission_set rps ON role.role_id = rps.role_id
-    #     JOIN sys_permission_set ps ON rps.permission_set_id = ps.set_id
-    #     JOIN sys_permission_set_item psi ON ps.set_id = psi.permission_set_id
-    #     JOIN sys_permission p ON psi.permission_id = p.permission_id
-    #     LEFT JOIN sys_resource r ON p.resource_id = r.resource_id
-    #     LEFT JOIN sys_data_scope ds ON p.data_scope_id = ds.scope_id
-    #     WHERE role.role_id = %s AND role.is_active = TRUE
-    #       AND rps.is_active = TRUE AND ps.is_active = TRUE
-    #       AND psi.is_active = TRUE AND p.is_active = TRUE
-    #       AND (r.resource_id IS NULL OR r.is_active = TRUE)
-    #     """
-
-    #     with connection.cursor() as cursor:
-    #         cursor.execute(sql, [self.role_id])
-    #         columns = [col[0] for col in cursor.description]
-    #         permissions = [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-    #     return permissions
-
     # 或者使用Django ORM的版本（更推荐，便于维护）
     def get_all_perms_orm(self):
-        """使用Django ORM获取角色所有权限"""
-        from django.db.models import Q
-
         # 获取角色关联的所有活跃权限集
-        permission_sets = (
-            self.sysrolepermissionset_set.filter(
-                is_active=True, permission_set__is_active=True
-            )
-            .select_related("permission_set")
-            .prefetch_related("permission_set__permission_items__permission")
-        )
+        permission_sets = self.permission_bindings.select_related(
+            "permission_set"
+        ).prefetch_related("permission_set__permission_items__permission")
 
         permissions = []
 
@@ -259,9 +210,7 @@ class SysRole(BaseModel):
             permission_set = role_perm_set.permission_set
 
             # 获取权限集中的所有权限项
-            perm_items = permission_set.permission_items.filter(
-                is_active=True, permission__is_active=True
-            ).select_related("permission")
+            perm_items = permission_set.permission_items.select_related("permission")
 
             for item in perm_items:
                 permission = item.permission
@@ -272,7 +221,7 @@ class SysRole(BaseModel):
                     "permission_code": permission.permission_code,
                     "permission_name": permission.permission_name,
                     "permission_type": permission.permission_type,
-                    "data_scope_id": permission.data_scope_id,
+                    "data_scope_id": permission.data_scope.pk,
                     "is_direct": False,  # 角色权限不是直接权限
                 }
 
@@ -419,26 +368,26 @@ class SysUser(AbstractUser):
         companies = self.get_company_tree()
         return any(company.pk == company_pk for company in companies)
 
-    def get_company_roles(self, company_id=None):
+    def get_company_roles(self, company_pk=None):
         """获取用户在指定公司下的角色"""
-        if not company_id:
+        if not company_pk:
             user_company = self.get_company()
-            company_id = user_company.company_id if user_company else None
+            company_pk = user_company.company_pk if user_company else None
 
         roles = []
 
         # 个人分配的角色（按公司过滤）
-        user_roles = self.user_roles.filter(is_active=True).select_related("role")
+        user_roles = self.user_roles.select_related("role")
         for user_role in user_roles:
             role = user_role.role
-            if not company_id or (role.company and role.company.pk == company_id):
+            if not company_pk or (role.company and role.company.pk == company_pk):
                 roles.append(role)
 
         # 部门分配的角色（按公司过滤）
         if self.department:
             dept_roles = self.department.get_available_roles()
             for role in dept_roles:
-                if not company_id or (role.company and role.company.pk == company_id):
+                if not company_pk or (role.company and role.company.pk == company_pk):
                     roles.append(role)
 
         # 去重
@@ -451,38 +400,13 @@ class SysUser(AbstractUser):
 
         return unique_roles
 
-    def get_all_roles(self, company_pk=None) -> List[SysRole]:
-        """获取用户所有角色（个人角色 + 部门角色）"""
-        roles: List[SysRole] = []
-
-        # 1. 个人直接分配的角色
-        user_roles = self.user_roles.filter(is_active=True).select_related("role")
-        roles.extend([ur.role for ur in user_roles])
-
-        # 2. 通过部门分配的角色
-        if self.department:
-            dept_roles = self.department.get_available_roles()
-            roles.extend(dept_roles)
-
-        # 去重
-        seen = set()
-        unique_roles = []
-        for role in roles:
-            if role.role_id not in seen:
-                seen.add(role.role_id)
-                unique_roles.append(role)
-
-        return unique_roles
-
     def get_accessible_companies(self):
         """获取用户可以访问的公司列表（基于数据权限）"""
         # 这里可以根据用户的数据权限范围返回可访问的公司
         # 例如：超级管理员可以访问所有公司，普通用户只能访问自己所在公司
         if self.has_permission("company_manage", SysPermission.PERM_MANAGE):
             # 有公司管理权限，可以访问所有活跃公司
-            return SysCompany.objects.filter(
-                status=SysCompany.COMPANY_STATUS_ACTIVE, is_active=True
-            )
+            return SysCompany.objects.filter(status=SysCompany.COMPANY_STATUS_ACTIVE)
         else:
             # 普通用户只能访问自己所在公司
             company = self.get_company()
@@ -507,50 +431,6 @@ class SysUser(AbstractUser):
         # 检查具体权限
         return self.has_permission(resource_code, required_permission_type)
 
-    def has_permission_with_dimensions(
-        self, resource_code, required_perm_type, dimension_values=None, company_pk=None
-    ):
-        """
-        检查用户是否拥有指定资源、权限类型和维度组合的权限
-        dimension_values: 字典，如{"delivery_method": "feed", "material_source": "delivery"}
-        """
-        if self.is_superuser:
-            return True
-
-        # 获取用户所有权限
-        permissions = self.get_all_perms(company_pk)
-
-        for perm in permissions:
-            # 检查资源和权限类型匹配
-            if perm.get("resource_code") != resource_code:
-                continue
-            if not self._perm_type_matches(perm, required_perm_type):
-                continue
-
-            # 检查维度匹配
-            if not self._dimension_matches(perm, dimension_values):
-                continue
-
-            return True
-        return False
-
-    def _dimension_matches(self, perm, dimension_values):
-        """检查权限的维度选项是否匹配请求的维度值"""
-        if not dimension_values:
-            return True
-
-        # 获取权限关联的维度选项
-        perm_dimensions = perm.get("dimension_options", {})
-
-        for dim_code, dim_value in dimension_values.items():
-            # 检查该维度是否在权限允许的范围内
-            if dim_code not in perm_dimensions:
-                return False
-            if dim_value not in perm_dimensions[dim_code]:
-                return False
-
-        return True
-
     def get_department_roles(self):
         """获取用户通过部门分配的角色"""
         if not self.department:
@@ -559,7 +439,7 @@ class SysUser(AbstractUser):
 
     def get_personal_roles(self):
         """获取用户个人分配的角色"""
-        return [ur.role for ur in self.user_roles.filter(is_active=True)]
+        return [ur.role for ur in self.user_roles]
 
     def has_department_role(self, role_code):
         """检查用户是否通过部门拥有某个角色"""
@@ -576,7 +456,7 @@ class SysUser(AbstractUser):
         permissions = []
 
         # 1. 获取角色权限（按公司过滤）
-        roles = self.get_all_roles(company_pk)
+        roles = self.get_company_roles(company_pk)
         for role in roles:
             role_permissions = role.get_all_perms()
             permissions.extend(role_permissions)
@@ -603,7 +483,7 @@ class SysUser(AbstractUser):
         """
         # 查询直接权限记录
         direct_perms_qs = (
-            SysUserDirectPermission.objects.filter(user=self, is_active=True)
+            SysUserDirectPermission.objects.filter(user=self)
             .select_related("permission", "permission__data_scope")
             .prefetch_related("permission__content_type")
         )
@@ -635,7 +515,7 @@ class SysUser(AbstractUser):
                 "permission_code": permission.permission_code,
                 "permission_name": permission.permission_name,
                 "permission_type": permission.permission_type,
-                "data_scope_id": permission.data_scope_id,
+                "data_scope_id": permission.data_scope.pk,
                 "data_scope_type": permission.data_scope.scope_type
                 if permission.data_scope
                 else None,
@@ -799,6 +679,295 @@ class SysUser(AbstractUser):
 
         return effective_perms
 
+    def get_all_perms_with_dimensions(self, company_pk=None):
+        """
+        获取用户所有权限（包含维度信息）
+        """
+        permissions = []
+
+        # 1. 获取角色权限（按公司过滤）
+        roles = self.get_company_roles(company_pk)
+        for role in roles:
+            role_permissions = self._get_role_perms_with_dimensions(role)
+            permissions.extend(role_permissions)
+
+        # 2. 获取直接权限（按公司过滤）
+        direct_perms = self._get_direct_permissions_with_dimensions(company_pk)
+        permissions.extend(direct_perms)
+
+        # 去重（基于权限编码和资源ID）
+        seen = set()
+        unique_permissions = []
+        for perm in permissions:
+            key = (perm.get("permission_code"), perm.get("resource_id"))
+            if key not in seen:
+                seen.add(key)
+                unique_permissions.append(perm)
+
+        return unique_permissions
+
+    def _get_role_perms_with_dimensions(self, role):
+        """获取角色权限（包含维度信息）"""
+        permissions = []
+
+        # 获取角色关联的权限集
+        role_permission_sets = SysRolePermissionSet.objects.filter(
+            role=role
+        ).select_related("permission_set")
+
+        for role_perm_set in role_permission_sets:
+            permission_set = role_perm_set.permission_set
+
+            # 获取权限集中的所有权限项
+            perm_items = permission_set.permission_items.select_related("permission")
+
+            for item in perm_items:
+                permission = item.permission
+                perm_data = self._build_permission_data(permission)
+                perm_data["is_direct"] = False
+                perm_data["permission_set_item"] = item
+                permissions.append(perm_data)
+
+        return permissions
+
+    def _get_direct_permissions_with_dimensions(self, company_pk=None):
+        """获取用户的直接权限（包含维度信息）"""
+        direct_perms_qs = (
+            SysUserDirectPermission.objects.filter(user=self)
+            .select_related("permission", "permission__data_scope")
+            .prefetch_related("permission__content_type")
+        )
+
+        # 按公司过滤
+        if company_pk:
+            direct_perms_qs = direct_perms_qs.filter(
+                models.Q(permission__company__isnull=True)
+                | models.Q(permission__company__pk=company_pk)
+            )
+
+        direct_permissions = []
+        for direct_perm in direct_perms_qs:
+            permission = direct_perm.permission
+            perm_data = self._build_permission_data(permission)
+            perm_data["is_direct"] = True
+            perm_data["user_direct_permission"] = direct_perm
+            direct_permissions.append(perm_data)
+
+        return direct_permissions
+
+    def _build_permission_data(self, permission):
+        """构建权限数据"""
+        # 获取关联的资源信息
+        resource = None
+        if permission.content_type and permission.object_id:
+            try:
+                resource = permission.content_type.get_object_for_this_type(
+                    pk=permission.object_id
+                )
+            except:
+                resource = None
+
+        perm_data = {
+            "permission_id": permission.permission_id,
+            "permission_code": permission.permission_code,
+            "permission_name": permission.permission_name,
+            "permission_type": permission.permission_type,
+            "data_scope_id": permission.data_scope_id,
+            "data_scope_type": permission.data_scope.scope_type
+            if permission.data_scope
+            else None,
+        }
+
+        # 添加资源信息
+        if resource:
+            perm_data.update(
+                {
+                    "resource_id": resource.resource_id,
+                    "resource_name": resource.resource_name,
+                    "resource_code": resource.resource_code,
+                    "resource_type": resource.resource_type,
+                    "path": getattr(resource, "path", ""),
+                    "table_name": getattr(resource, "table_name", ""),
+                    "model_class": getattr(resource, "model_class", ""),
+                    "creator_field": getattr(resource, "creator_field", "created_by"),
+                }
+            )
+
+        return perm_data
+
+    def get_enhanced_data_scope_condition(
+        self, table_name, permission_type=SysPermission.PERM_READ
+    ):
+        """
+        获取增强的数据范围条件（包含维度权限）
+        """
+        # 查找对应的表资源
+        table_resource = SysTableResource.objects.filter(table_name=table_name).first()
+
+        if not table_resource:
+            return "1=0"
+
+        # 获取基础数据范围条件
+        base_condition = self.get_data_scope_condition(table_name, permission_type)
+
+        # 获取维度条件
+        dimension_conditions = self._get_dimension_conditions(
+            table_resource, permission_type
+        )
+
+        if dimension_conditions:
+            return f"({base_condition}) AND ({dimension_conditions})"
+        else:
+            return base_condition
+
+    def _get_dimension_conditions(self, table_resource, permission_type):
+        """获取维度条件"""
+        all_permissions = self.get_all_perms_with_dimensions()
+        dimension_conditions = []
+
+        for perm_data in all_permissions:
+            if (
+                perm_data.get("table_name") == table_resource.table_name
+                and perm_data.get("permission_type") == permission_type
+            ):
+                dimension_condition = None
+                if perm_data.get("is_direct"):
+                    # 直接权限的维度条件
+                    user_direct_perm = perm_data.get("user_direct_permission")
+                    if user_direct_perm:
+                        dimension_condition = (
+                            user_direct_perm.get_dimension_sql_conditions(
+                                table_resource
+                            )
+                        )
+                else:
+                    # 角色权限的维度条件
+                    permission_set_item = perm_data.get("permission_set_item")
+                    if permission_set_item:
+                        dimension_condition = (
+                            permission_set_item.get_dimension_sql_conditions(
+                                table_resource
+                            )
+                        )
+
+                if dimension_condition:
+                    dimension_conditions.append(dimension_condition)
+
+        # 合并所有维度条件（OR逻辑）
+        if dimension_conditions:
+            return " OR ".join([f"({cond})" for cond in dimension_conditions])
+        return None
+
+    def filter_queryset_by_permission_with_dimensions(
+        self, queryset, permission_type=SysPermission.PERM_READ
+    ):
+        """
+        根据用户权限（包含维度）过滤查询集
+        """
+        model = queryset.model
+        table_name = model._meta.db_table
+
+        # 获取增强的数据范围条件
+        condition = self.get_enhanced_data_scope_condition(table_name, permission_type)
+
+        if condition == "1=1":
+            return queryset  # 全部数据，无需过滤
+        elif condition == "1=0":
+            return queryset.none()  # 无权限，返回空查询集
+        else:
+            # 使用extra方法应用自定义WHERE条件
+            return queryset.extra(where=[condition])
+
+    def has_permission_with_dimensions(
+        self,
+        resource_code,
+        required_permission_type,
+        company_pk=None,
+        dimension_filters=None,
+    ):
+        """
+        检查用户是否对指定资源拥有所需权限（包含维度检查）
+        """
+        if self.is_superuser:
+            return True
+
+        permissions = self.get_all_perms_with_dimensions(company_pk)
+
+        # 获取用户对该资源的所有权限类型
+        for perm in permissions:
+            if perm.get("resource_code") != resource_code:
+                continue
+
+            user_perm_type = perm.get("permission_type")
+            if not user_perm_type:
+                continue
+
+            # 1. manage 权限覆盖所有
+            if user_perm_type == SysPermission.PERM_MANAGE:
+                return True
+
+            # 2. 精确匹配
+            if user_perm_type == required_permission_type:
+                # 检查维度权限
+                if dimension_filters and self._check_dimension_permission(
+                    perm, dimension_filters
+                ):
+                    return True
+                elif not dimension_filters:
+                    return True
+
+        return False
+
+    def _check_dimension_permission(self, permission_data, dimension_filters):
+        """检查维度权限"""
+        # 这里需要根据具体业务逻辑实现维度权限检查
+        # dimension_filters 格式: {'dimension_code': 'expected_value'}
+
+        if permission_data.get("is_direct"):
+            user_direct_perm = permission_data.get("user_direct_permission")
+            if user_direct_perm:
+                return self._check_direct_permission_dimensions(
+                    user_direct_perm, dimension_filters
+                )
+        else:
+            permission_set_item = permission_data.get("permission_set_item")
+            if permission_set_item:
+                return self._check_permission_set_item_dimensions(
+                    permission_set_item, dimension_filters
+                )
+
+        return False
+
+    def _check_direct_permission_dimensions(self, user_direct_perm, dimension_filters):
+        """检查直接权限的维度"""
+        dimension_options = user_direct_perm.get_dimension_options()
+        return self._check_dimension_filters(dimension_options, dimension_filters)
+
+    def _check_permission_set_item_dimensions(
+        self, permission_set_item, dimension_filters
+    ):
+        """检查权限集项的维度"""
+        dimension_options = permission_set_item.get_dimension_options()
+        return self._check_dimension_filters(dimension_options, dimension_filters)
+
+    def _check_dimension_filters(self, dimension_options, dimension_filters):
+        """检查维度过滤器"""
+        if not dimension_filters:
+            return True
+
+        for dim_code, expected_value in dimension_filters.items():
+            has_matching_option = False
+            for dim_option_rel in dimension_options:
+                if (
+                    dim_option_rel.dimension_option.dimension.dimension_code == dim_code
+                    and dim_option_rel.dimension_option.option_value == expected_value
+                ):
+                    has_matching_option = True
+                    break
+            if not has_matching_option:
+                return False
+        return True
+
 
 class SysUserDepartment(BaseModel):
     """
@@ -857,7 +1026,6 @@ class SysUserRole(BaseModel):
 
     def clean(self):
         """验证用户和角色公司一致性"""
-        from django.core.exceptions import ValidationError
 
         user_company = self.user.get_company()
         role_company = self.role.company
