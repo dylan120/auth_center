@@ -7,7 +7,7 @@ from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
 from accounts.models.perms import SysPermission, SysUserDirectPermission
-from accounts.models.resources import SysDataScope
+from accounts.models.scope import SysDataScope
 
 
 class SysCompany(BaseModel):
@@ -364,23 +364,13 @@ class SysUser(AbstractUser):
 
     cn_name = models.CharField(max_length=100, verbose_name=_("显示名称"))
 
-    department = models.ForeignKey(
-        SysDepartment,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="users",
-        verbose_name=_("所属部门"),
-    )
-
-    # 用户直接关联的权限（用于特殊权限，优先级高于角色权限）
-    # direct_permissions = models.ManyToManyField(
-    #     "SysPermission",
-    #     through="SysUserDirectPermission",
-    #     through_fields=("user", "permission"),
-    #     related_name="direct_users",
-    #     verbose_name=_("直接权限"),
+    # department = models.ForeignKey(
+    #     SysDepartment,
+    #     on_delete=models.SET_NULL,
+    #     null=True,
     #     blank=True,
+    #     related_name="users",
+    #     verbose_name=_("所属部门"),
     # )
 
     class Meta:
@@ -516,6 +506,50 @@ class SysUser(AbstractUser):
 
         # 检查具体权限
         return self.has_permission(resource_code, required_permission_type)
+
+    def has_permission_with_dimensions(
+        self, resource_code, required_perm_type, dimension_values=None, company_pk=None
+    ):
+        """
+        检查用户是否拥有指定资源、权限类型和维度组合的权限
+        dimension_values: 字典，如{"delivery_method": "feed", "material_source": "delivery"}
+        """
+        if self.is_superuser:
+            return True
+
+        # 获取用户所有权限
+        permissions = self.get_all_perms(company_pk)
+
+        for perm in permissions:
+            # 检查资源和权限类型匹配
+            if perm.get("resource_code") != resource_code:
+                continue
+            if not self._perm_type_matches(perm, required_perm_type):
+                continue
+
+            # 检查维度匹配
+            if not self._dimension_matches(perm, dimension_values):
+                continue
+
+            return True
+        return False
+
+    def _dimension_matches(self, perm, dimension_values):
+        """检查权限的维度选项是否匹配请求的维度值"""
+        if not dimension_values:
+            return True
+
+        # 获取权限关联的维度选项
+        perm_dimensions = perm.get("dimension_options", {})
+
+        for dim_code, dim_value in dimension_values.items():
+            # 检查该维度是否在权限允许的范围内
+            if dim_code not in perm_dimensions:
+                return False
+            if dim_value not in perm_dimensions[dim_code]:
+                return False
+
+        return True
 
     def get_department_roles(self):
         """获取用户通过部门分配的角色"""
@@ -694,10 +728,9 @@ class SysUser(AbstractUser):
         scope_type = best_scope.get("data_scope_type")
         creator_field = best_scope.get("creator_field", "created_by")
 
-        if scope_type == SysDataScope.SCOPE_ALL:
-            return "1=1"  # 全部数据
-        elif scope_type == SysDataScope.SCOPE_SELF:
+        if scope_type == SysDataScope.SCOPE_SELF:
             return f"{creator_field} = {self.id}"
+
         elif scope_type == SysDataScope.SCOPE_DEPT:
             if self.department:
                 dept_users = self.department.get_all_users()
@@ -705,6 +738,14 @@ class SysUser(AbstractUser):
                 if user_ids:
                     return f"{creator_field} IN ({','.join(user_ids)})"
             return "1=0"
+
+        elif scope_type == SysDataScope.SCOPE_COMPANY:
+            company = self.get_company()
+            if not company:
+                return "1=0"
+            subsidiaries = company.get_all_subsidiaries()
+            company_ids = [str(c.company_id) for c in subsidiaries]
+            return f"company_id IN ({','.join(company_ids)})"
 
         return "1=0"
 
@@ -757,6 +798,32 @@ class SysUser(AbstractUser):
                         )
 
         return effective_perms
+
+
+class SysUserDepartment(BaseModel):
+    """
+    部门与用户的关联关系
+    """
+
+    department = models.ForeignKey(
+        SysDepartment,
+        on_delete=models.CASCADE,
+        related_name="dept_users",
+        verbose_name=_("部门"),
+    )
+
+    user = models.ForeignKey(
+        SysUser,
+        on_delete=models.CASCADE,
+        related_name="user_depts",
+        verbose_name=_("用户"),
+    )
+
+    class Meta:
+        db_table = "sys_department_user"
+        verbose_name = _("部门用户关联")
+        verbose_name_plural = _("部门用户关联")
+        unique_together = ("department", "user")
 
 
 class SysUserRole(BaseModel):

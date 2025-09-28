@@ -139,7 +139,7 @@ class PermissionTestBase(TestCase):
 
     def create_data_scopes(self):
         """创建数据范围"""
-        self.scope_all = SysDataScope.objects.create(
+        self.scope_company = SysDataScope.objects.create(
             scope_name="全部数据", scope_type=SysDataScope.SCOPE_ALL
         )
 
@@ -191,8 +191,8 @@ class PermissionTestBase(TestCase):
             resource_code="field_username",
             table_resource=self.table_user,
             field_name="username",
-            field_type="varchar",
-            field_label="用户名",
+            # field_type="varchar",
+            # field_label="用户名",
         )
 
         self.field_email = SysFieldResource.objects.create(
@@ -200,8 +200,8 @@ class PermissionTestBase(TestCase):
             resource_code="field_email",
             table_resource=self.table_user,
             field_name="email",
-            field_type="varchar",
-            field_label="邮箱",
+            # field_type="varchar",
+            # field_label="邮箱",
         )
 
         self.field_salary = SysFieldResource.objects.create(
@@ -209,9 +209,9 @@ class PermissionTestBase(TestCase):
             resource_code="field_salary",
             table_resource=self.table_user,
             field_name="salary",
-            field_type="decimal",
-            field_label="薪资",
-            is_sensitive=True,
+            # field_type="decimal",
+            # field_label="薪资",
+            # is_sensitive=True,
         )
 
     def create_permission_sets(self):
@@ -269,7 +269,7 @@ class PermissionTestBase(TestCase):
             permission_code="table_user_read",
             permission_name="查看用户表",
             permission_type=SysPermission.PERM_READ,
-            data_scope=self.scope_all,
+            data_scope=self.scope_company,
         )
 
         self.perm_table_user_self_read = SysPermission.objects.create(

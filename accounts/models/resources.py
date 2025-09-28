@@ -1,46 +1,9 @@
+from django.apps import apps
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
-
-
-class SysDataScope(BaseModel):
-    """
-    数据权限范围定义 - 简化版：只支持全部数据和仅本人数据
-    """
-
-    # 数据范围类型（简化版）
-    SCOPE_ALL = 1  # 全部数据
-    SCOPE_SELF = 2  # 仅本人数据
-    SCOPE_DEPT = 3  # 仅部门数据
-    # SCOPE_CUSTOM = 3  # 自定义范围（可选）
-
-    SCOPE_TYPE_CHOICES = (
-        (SCOPE_ALL, _("全部数据")),
-        (SCOPE_SELF, _("仅本人数据")),
-        (SCOPE_DEPT, _("部门数据")),
-        # (SCOPE_CUSTOM, _("自定义范围")),
-    )
-
-    scope_id = models.AutoField(primary_key=True, verbose_name=_("数据范围ID"))
-    scope_name = models.CharField(
-        max_length=100, unique=True, verbose_name=_("范围名称")
-    )
-    scope_type = models.IntegerField(
-        choices=SCOPE_TYPE_CHOICES, verbose_name=_("范围类型")
-    )
-
-    # 自定义SQL条件（用于SCOPE_CUSTOM类型）
-    # custom_sql = models.TextField(blank=True, verbose_name=_("自定义SQL条件"))
-    description = models.TextField(blank=True, verbose_name=_("范围描述"))
-
-    class Meta:
-        db_table = "sys_data_scope"
-        verbose_name = _("数据范围")
-        verbose_name_plural = _("数据范围")
-
-    def __str__(self):
-        return f"{self.scope_name}"
 
 
 class SysResource(BaseModel):
@@ -50,14 +13,14 @@ class SysResource(BaseModel):
 
     # 资源类型
     RESOURCE_MENU = "menu"  # 菜单
-    RESOURCE_API = "api"  # API接口
     RESOURCE_MODULE = "module"  # 业务模块
     RESOURCE_TABLE = "table"  # 数据表资源
     RESOURCE_FIELD = "field"  # 数据字段
+    # RESOURCE_API = "api"  # API接口
 
     RESOURCE_TYPE_CHOICES = (
         (RESOURCE_MENU, _("菜单")),
-        (RESOURCE_API, _("API接口")),
+        # (RESOURCE_API, _("API接口")),
         (RESOURCE_FIELD, _("数据字段")),
         (RESOURCE_MODULE, _("业务模块")),
         (RESOURCE_TABLE, _("数据表")),
@@ -80,7 +43,7 @@ class SysResource(BaseModel):
         ordering = ["resource_type", "sort_order", "resource_id"]
 
     def __str__(self):
-        return f"{self.resource_name} ({self.get_resource_type_display()})"
+        return f"{self.resource_name} ({self.resource_code})"
 
 
 # 具体的资源类型表
@@ -89,33 +52,23 @@ class SysMenuResource(SysResource):
     菜单资源表
     """
 
-    # 资源所属公司（Null表示全局资源）
-    # company = models.ForeignKey(
-    #     "SysCompany",
-    #     on_delete=models.CASCADE,
-    #     null=True,
-    #     blank=True,
-    #     related_name="menu_resources",
-    #     verbose_name=_("所属公司"),
-    # )
-    # 菜单特定字段
-    path = models.CharField(max_length=200, verbose_name=_("菜单路径"))
-    icon = models.CharField(max_length=50, blank=True, verbose_name=_("菜单图标"))
-    component = models.CharField(max_length=100, verbose_name=_("前端组件"))
-    parent_menu = models.ForeignKey(
-        "self",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="children",
-        verbose_name=_("父级菜单"),
+    parent_id = models.IntegerField("父节点id", default=0)
+    name = models.CharField("名称", max_length=50, db_index=True)
+    url = models.CharField("访问地址带参数", max_length=400, blank=True, default="")
+    url_path = models.CharField("访问路径", max_length=100, null=False, db_index=True)
+    icon = models.CharField("图标", max_length=100, null=True, blank=True, default="")
+    css = models.CharField("样式", max_length=100, null=True, blank=True, default="")
+    order = models.IntegerField("排序", default=0)
+    is_show = models.IntegerField("显示", default=1)
+    is_log = models.IntegerField("记录日志", default=0)
+    type = models.IntegerField("菜单类型", default=0)
+    is_trace = models.IntegerField("跟踪", default=0)  # 0:否，1：是
+    remark = models.CharField(
+        "备注", max_length=10000, default="", null=True, blank=True
     )
-    # 菜单级别
-    menu_level = models.IntegerField(default=1, verbose_name=_("菜单层级"))
-    # 是否外链
-    is_external = models.BooleanField(default=False, verbose_name=_("是否外链"))
-    # 是否缓存
-    keep_alive = models.BooleanField(default=True, verbose_name=_("是否缓存"))
+    # objects = CacheManager
+    level = models.IntegerField("权限等级", default=0)  # 1 ~ 5 数字越大，权限越高
+    menu_type = models.IntegerField("菜单类型", default="0")  # 数据  操作
 
     class Meta:
         db_table = "sys_menu_resource"
@@ -125,6 +78,21 @@ class SysMenuResource(SysResource):
     def save(self, *args, **kwargs):
         # 自动设置资源类型
         self.resource_type = SysResource.RESOURCE_MENU
+        super().save(*args, **kwargs)
+
+
+class SysModuleResource(SysResource):
+    """
+    业务模块资源表
+    """
+
+    class Meta:
+        db_table = "sys_module_resource"
+        verbose_name = _("模块资源")
+        verbose_name_plural = _("模块资源")
+
+    def save(self, *args, **kwargs):
+        self.resource_type = SysResource.RESOURCE_MODULE
         super().save(*args, **kwargs)
 
 
@@ -154,6 +122,56 @@ class SysTableResource(SysResource):
         self.resource_type = SysResource.RESOURCE_TABLE
         super().save(*args, **kwargs)
 
+    # def get_model_class(self):
+    #     """
+    #     根据 model_class 字符串动态导入并返回模型类
+    #     model_class 示例: 'myapp.MyModel'
+    #     """
+    #     try:
+    #         app_label, model_name = self.model_class.rsplit(".", 1)
+    #         # 使用 Django Apps registry 获取模型（推荐）
+    #         return apps.get_model(app_label, model_name)
+    #     except (ValueError, LookupError) as e:
+    #         raise ValidationError(f"无法加载模型 {self.model_class}: {e}")
+
+    # def get_fields(self):
+    #     """
+    #     动态获取该表资源对应模型的所有字段
+    #     返回: [
+    #         {'field_name': 'name', 'verbose_name': '姓名', 'type': 'CharField'},
+    #         {'field_name': 'age', 'verbose_name': '年龄', 'type': 'IntegerField'},
+    #         ...
+    #     ]
+    #     """
+    #     model_cls = self.get_model_class()
+    #     fields = []
+
+    #     for field in model_cls._meta.get_fields():
+    #         # 可以根据需要过滤字段，比如排除多对多、外键关系等
+    #         if field.concrete:  # 只取数据库实际存在的字段
+    #             fields.append(
+    #                 {
+    #                     "field_name": field.name,
+    #                     "verbose_name": str(field.verbose_name).strip() or field.name,
+    #                     "field_type": field.__class__.__name__,
+    #                     # 可扩展：是否可编辑、是否必填等
+    #                     "editable": getattr(field, "editable", True),
+    #                     "blank": getattr(field, "blank", False),
+    #                 }
+    #             )
+
+    #     return fields
+
+    # def get_field_resource(self, field_name):
+    #     """
+    #     模拟返回一个“字段资源”对象（字典）
+    #     """
+    #     fields = self.get_fields()
+    #     for field in fields:
+    #         if field["field_name"] == field_name:
+    #             return field
+    #     return None
+
     def get_fields(self):
         """获取表的所有字段资源"""
         return SysFieldResource.objects.filter(table_resource=self, is_active=True)
@@ -176,23 +194,6 @@ class SysFieldResource(SysResource):
         verbose_name=_("所属表资源"),
     )
     field_name = models.CharField(max_length=100, verbose_name=_("字段名"))
-    field_type = models.CharField(max_length=50, verbose_name=_("字段类型"))
-    # 字段显示名称
-    field_label = models.CharField(max_length=100, verbose_name=_("字段标签"))
-    # 是否敏感字段
-    is_sensitive = models.BooleanField(default=False, verbose_name=_("敏感字段"))
-    # 是否必填字段
-    is_required = models.BooleanField(default=False, verbose_name=_("必填字段"))
-    # 字段长度限制
-    max_length = models.IntegerField(null=True, blank=True, verbose_name=_("最大长度"))
-    # 字段默认值
-    default_value = models.CharField(
-        max_length=200, blank=True, verbose_name=_("默认值")
-    )
-    # 字段验证规则
-    validation_rules = models.JSONField(
-        default=dict, blank=True, verbose_name=_("验证规则")
-    )
 
     class Meta:
         db_table = "sys_field_resource"
@@ -202,45 +203,10 @@ class SysFieldResource(SysResource):
 
     def save(self, *args, **kwargs):
         self.resource_type = SysResource.RESOURCE_FIELD
-        # 自动设置公司（从表资源继承）
-        # if not self.company and self.table_resource:
-        #     self.company = self.table_resource.company
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.table_resource.table_name}.{self.field_name}"
-
-
-class SysModuleResource(SysResource):
-    """
-    业务模块资源表
-    """
-
-    # 模块特定字段
-    module_code = models.CharField(
-        max_length=50, unique=True, verbose_name=_("模块编码")
-    )
-    # 模块版本
-    version = models.CharField(max_length=20, default="1.0.0", verbose_name=_("版本号"))
-    # 模块入口
-    entry_point = models.CharField(max_length=200, blank=True, verbose_name=_("入口点"))
-    # 依赖模块
-    dependencies = models.JSONField(
-        default=list, blank=True, verbose_name=_("依赖模块")
-    )
-    # 模块配置
-    config = models.JSONField(default=dict, blank=True, verbose_name=_("模块配置"))
-    # 是否启用
-    is_enabled = models.BooleanField(default=True, verbose_name=_("是否启用"))
-
-    class Meta:
-        db_table = "sys_module_resource"
-        verbose_name = _("模块资源")
-        verbose_name_plural = _("模块资源")
-
-    def save(self, *args, **kwargs):
-        self.resource_type = SysResource.RESOURCE_MODULE
-        super().save(*args, **kwargs)
 
 
 # class SysApiResource(SysResource):

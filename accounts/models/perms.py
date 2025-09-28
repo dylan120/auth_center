@@ -5,7 +5,6 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from accounts.models import BaseModel
-from accounts.models.resources import SysDataScope
 
 
 class SysRolePermissionSet(BaseModel):
@@ -145,7 +144,7 @@ class SysPermission(BaseModel):
     )
     # 关联数据范围
     data_scope = models.ForeignKey(
-        SysDataScope,
+        "SysDataScope",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -169,6 +168,16 @@ class SysPermission(BaseModel):
         if self.permission_type == self.PERM_MANAGE:
             return True
         return self.permission_type == target_perm_type
+
+    def clean(self):
+        if self.company is None:
+            if SysPermission.objects.filter(
+                content_type=self.content_type,
+                object_id=self.object_id,
+                permission_type=self.permission_type,
+                company__isnull=True,
+            ).exists():
+                raise ValidationError("全局权限已存在，不可重复创建。")
 
     def __str__(self):
         return f"{self.resource.resource_name}.{self.permission_name}"
