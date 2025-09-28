@@ -1,0 +1,19 @@
+{
+    "git.enableSmartCommit": true,
+    "git.confirmSync": false,
+    "chat.commandCenter.enabled": false,
+    "editor.accessibilitySupport": "on",
+    "workbench.secondarySideBar.defaultVisibility": "hidden",
+    "workbench.editor.enablePreview": false,
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "always"
+        }
+    },
+    "pylint.args": [
+        "--load-plugins=pylint_django",
+        "--django-settings-module=auth_center.settings" 
+    ]
+}
