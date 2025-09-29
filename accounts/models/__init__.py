@@ -1,5 +1,5 @@
 """
-base model
+base model for easy use
 """
 
 from django.db import models
