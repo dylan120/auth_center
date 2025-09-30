@@ -1,11 +1,13 @@
+from datetime import datetime
 from typing import List
 
-from django.contrib.auth.hashers import check_password, make_password
-from django.contrib.auth.models import AbstractUser
+# from django.contrib.auth.hashers import check_password, make_password
+# from django.contrib.auth.models import AbstractBaseUser
 from django.core.exceptions import ValidationError
 from django.db import connection, models
 from django.utils.translation import gettext_lazy as _
 
+from accounts.manager.sys_user_manager import SysUserManager
 from accounts.models import BaseModel
 from accounts.models.perms import (
     SysPermission,
@@ -330,10 +332,42 @@ class SysDepartmentRole(BaseModel):
         return f"{self.department.dept_name} - {self.role.role_name}"
 
 
-class SysUser(AbstractUser):
+class SysUser(BaseModel):
     """系统用户模型"""
 
-    cn_name = models.CharField(max_length=100, verbose_name=_("显示名称"))
+    USER_STATUS_NORMAL = 0  # 正常
+    USER_STATUS_LOCAK = 1  # 锁定
+    USER_STATUS_DELETE = 2  # 删除
+    USER_STATUS_PENDING = 3  # 待分配
+
+    USER_STATUS_CHOICES = (
+        (USER_STATUS_NORMAL, _("正常")),
+        (USER_STATUS_LOCAK, _("锁定")),
+        (USER_STATUS_DELETE, _("删除")),
+        (USER_STATUS_PENDING, _("待分配")),
+    )
+
+    phone = models.CharField("手机号", max_length=11, unique=True)
+    email = models.EmailField("邮箱", blank=True, null=True)
+    full_name = models.CharField("姓名", max_length=150, blank=True)
+    is_active = models.BooleanField("激活状态", default=True)
+    is_super = models.BooleanField("管理员", default=False)
+    date_joined = models.DateTimeField("注册时间", auto_now_add=True)
+    last_ip = models.CharField("最后登录ip", max_length=20)
+    last_time = models.DateTimeField("最后登录时间", default=datetime.now)
+    login_count = models.IntegerField("登录次数", default=0)
+    login_err_count = models.IntegerField("登录错误次数", default=0)
+    lock_time = models.DateTimeField("锁定时间", null=True, blank=True)
+    login_err_time = models.DateTimeField("登录错误时间", null=True, blank=True)
+    is_white = models.IntegerField("白名单", default=0)  # 0否， 1:是
+    reason = models.CharField("申请理由", max_length=255)
+    status = models.IntegerField("状态", default=0, choices=USER_STATUS_CHOICES)
+
+    # 设置 phone 为登录字段
+    USERNAME_FIELD = "phone"
+    REQUIRED_FIELDS = ["email"]  # 创建 superuser 时需要输入的字段
+
+    objects = SysUserManager()
 
     class Meta:
         db_table = "sys_user"
@@ -343,13 +377,13 @@ class SysUser(AbstractUser):
     def __str__(self):
         return str(self.cn_name) or str(self.username)
 
-    def set_password(self, raw_password):
-        """加密密码"""
-        self.password = make_password(raw_password)
+    # def set_password(self, raw_password):
+    #     """加密密码"""
+    #     self.password = make_password(raw_password)
 
-    def check_password(self, raw_password):
-        """验证密码"""
-        return check_password(raw_password, self.password)
+    # def check_password(self, raw_password):
+    #     """验证密码"""
+    #     return check_password(raw_password, self.password)
 
     def get_company(self, company_pk) -> SysCompany:
         """获取用户在指定公司的所属公司"""

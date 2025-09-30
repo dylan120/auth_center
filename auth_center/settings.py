@@ -32,7 +32,7 @@ ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     # "django.contrib.admin",
-    "django.contrib.auth",
+    # "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
@@ -46,7 +46,7 @@ MIDDLEWARE = [
     "django.contrib.sessions.middleware.SessionMiddleware",  # 会话支持中间件
     "django.middleware.common.CommonMiddleware",  # 通用中间件
     "django.middleware.csrf.CsrfViewMiddleware",  # CSRF 保护中间件
-    "django.contrib.auth.middleware.AuthenticationMiddleware",  # 认证中间件
+    # "django.contrib.auth.middleware.AuthenticationMiddleware",  # 认证中间件
     "accounts.middleware.SessionAuthenticationMiddleware",  # Session 认证中间件
     "django.contrib.messages.middleware.MessageMiddleware",  # 消息中间件
     "django.middleware.clickjacking.XFrameOptionsMiddleware",  # 点击劫持保护
@@ -125,4 +125,4 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 
-AUTH_USER_MODEL = "accounts.SysUser"
+# AUTH_USER_MODEL = "accounts.SysUser"
